@@ -1,0 +1,48 @@
+name: "CLA Assistant"
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+jobs:
+  CLAAssistant:
+    runs-on: ubuntu-latest
+    # contributor-assistant/github-action stores signatures in
+    # `signatures/version1/cla.json` on the configured branch and
+    # comments on the PR; both need write access. The default
+    # `secrets.GITHUB_TOKEN` only grants `contents: read` on
+    # `pull_request_target`, which produced "Could not retrieve
+    # repository contents. Status: 404" on the first run after the
+    # repo went public. Granting the action the minimum permissions
+    # it actually needs.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      statuses: write
+      actions: write
+    steps:
+      - name: "CLA Assistant"
+        if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
+        # Alpha Release
+        uses: contributor-assistant/github-action@v2.4.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # To store signatures in a private repository, uncomment and use a PAT
+          # PERSONAL_ACCESS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+        with:
+          path-to-signatures: 'signatures/version1/cla.json'
+          path-to-document: 'https://github.com/${{ github.repository }}/blob/main/CLA.md'
+          branch: 'main'
+          allowlist: dependabot[bot],renovate[bot]
+          lock-pullrequest-aftermerge: false
+          create-file-commit-message: 'chore: setup CLA signatures file'
+          signed-commit-message: 'chore: $username CLA signature added'
+          custom-notsigned-prcomment: |
+            Thanks for the contribution. Before we can merge, please sign our [Contributor License Agreement](https://github.com/${{ github.repository }}/blob/main/CLA.md) by replying to this comment with exactly:
+
+            `I have read the CLA Document and I hereby sign the CLA`
+          custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
+          custom-allsigned-prcomment: 'All contributors have signed the CLA. Thank you!'

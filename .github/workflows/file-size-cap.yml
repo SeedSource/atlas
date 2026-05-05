@@ -1,0 +1,113 @@
+name: File size cap (≤500 LoC per .rs)
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-file-sizes:
+    name: Enforce ≤500 LoC per source file
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check no .rs file exceeds 500 lines
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cap is 500 LoC per Rust source file in crates/.
+          # Allow-list: previously held the last two unsplittable
+          # monoliths (`chat.rs` 1121 LoC and `chat_stream.rs` 1484 LoC).
+          # Wave 4g (2026-05-03) lifted both via the `Ctx`+`State`
+          # struct pattern.
+          #
+          # The five entries below are launch-day carry-overs: each is
+          # marginally over 500 LoC (505-528) and waiting on a clean
+          # split. Adding to this list requires a rationale comment AND
+          # a tracking issue.
+          allow_list=(
+            # 524 LoC — single-file FFI surface for the NCCL backend.
+            # Splitting requires moving the unsafe-impl Send/Sync block
+            # and ~30 cudarc/cuda-driver C-binding wrappers into a
+            # `nccl_ffi/` submodule; deferred until after launch.
+            "crates/spark-comm/src/nccl_backend.rs"
+            # 528 LoC — Model trait definition + default impls.
+            # Atomic interface; splitting hurts discoverability for
+            # external contributors. Candidate for a `traits/model/mod.rs`
+            # split that pulls verify/decode default impls into siblings.
+            "crates/spark-model/src/traits/model.rs"
+            # 513 LoC — Gemma-4 weight loader (variant-dispatch family).
+            # Already part of a `gemma4/` split; the leftover holds the
+            # single-file dispatch entry-point + per-layer-type orchestration.
+            "crates/spark-model/src/weight_loader/gemma4/loader_a.rs"
+            # 512 LoC — single chunked-prefill phase. Already part of a
+            # `prefill_b/`-style split family; the leftover is one long
+            # function with too many local closures to extract cleanly.
+            "crates/spark-model/src/model/trait_impl/prefill_c.rs"
+            # 507 LoC — single-token decode attention forward.
+            # Compute-heavy template (kernel-launch sequence + buffer
+            # ping-pong); splitting fragments the launch order, which is
+            # critical for CUDA graph capture correctness.
+            "crates/spark-model/src/layers/qwen3_attention/decode/attention_forward.rs"
+            # 537 LoC — multi-sequence QKV projection orchestration.
+            # Heavy stride/pointer arithmetic that's easier to audit in
+            # one file than fragmented across siblings.
+            "crates/spark-model/src/layers/qwen3_attention/trait_impl/multi_seq/qkv.rs"
+            # 517 LoC — one-step decode-logit transform. Tightly coupled
+            # to the sampler context; splitting risks inflating the
+            # cross-file pub(super) surface.
+            "crates/spark-server/src/scheduler/decode_logits_step.rs"
+            # 516 LoC — startup orchestration (12 phases, all named).
+            # Already heavily split (`serve_phases`, `serve_router`); the
+            # remaining body is the linear bootstrapping sequence.
+            "crates/spark-server/src/main_modules/serve.rs"
+            # 509 LoC — single integration test orchestration; one
+            # comprehensive end-to-end harness. Splitting would require
+            # extracting fixtures into a shared module that's only used
+            # by this single test, adding indirection for no payoff.
+            "crates/spark-server/tests/integration.rs"
+          )
+
+          violations=0
+          while IFS= read -r -d '' file; do
+            lines=$(wc -l < "$file")
+            if [[ $lines -gt 500 ]]; then
+              # Strip leading "./" if present
+              normalized="${file#./}"
+              # Check allow-list
+              allowed=0
+              for entry in "${allow_list[@]}"; do
+                if [[ "$normalized" == "$entry" ]]; then
+                  allowed=1
+                  break
+                fi
+              done
+              if [[ $allowed -eq 1 ]]; then
+                echo "::warning file=$normalized::Allow-listed: $lines LoC (>500). Reduce when feasible."
+              else
+                echo "::error file=$normalized::$lines LoC exceeds 500-line cap. Split into sub-modules per Atlas idiom (see crates/spark-model/src/layers/qwen3_attention/ for compute-heavy template, crates/spark-model/src/weight_loader/ for variant-dispatch template)."
+                violations=$((violations + 1))
+              fi
+            fi
+          done < <(find crates -name '*.rs' -not -name '*.bak' -not -path '*/target/*' -print0)
+
+          if [[ $violations -gt 0 ]]; then
+            echo ""
+            echo "❌ $violations file(s) exceed the 500-line cap. Split them per Atlas idiom."
+            echo ""
+            echo "Quick fix: extract a cohesive cluster (impl block, related fns, tests)"
+            echo "to a sibling file:"
+            echo "  1. cp foo.rs foo.rs.bak"
+            echo "  2. mkdir foo/  (Rust 2018+ allows foo.rs + foo/ submodules)"
+            echo "  3. Move the cluster to foo/<cluster>.rs with pub(super) on cross-file private items"
+            echo "  4. Add 'mod <cluster>;' + 'pub use <cluster>::*' as needed in foo.rs"
+            echo "  5. cargo check -p <crate> must pass"
+            exit 1
+          fi
+
+          echo "✓ All .rs files in crates/ are ≤500 LoC (or in the allow-list)."

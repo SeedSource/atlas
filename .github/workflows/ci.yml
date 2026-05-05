@@ -1,0 +1,250 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Skip CUDA/nvcc in build.rs so clippy/check can run on hosts without a GPU.
+  # Emits a stub target_ptx.rs that satisfies the atlas-kernels include.
+  ATLAS_SKIP_BUILD: "1"
+  # Short-circuit cudarc's nvcc probe (format is {major}0{minor}0; 13000 == CUDA 13.0).
+  # Required for `cargo test` on a runner without nvcc.
+  CUDARC_CUDA_VERSION: "13000"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy --tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install vendor/xgrammar-rs build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Lint policy lives in the workspace `Cargo.toml` `[workspace.lints]`
+      # block (deny `warnings` + `clippy::all`, with a few targeted
+      # allows for kernel-style signatures). Each crate inherits via
+      # `[lints] workspace = true`, and `lib.rs` / `main.rs` re-add the
+      # same denies as inner attributes so they apply even when the
+      # workspace lints table isn't honoured (e.g. older tooling).
+      - run: cargo clippy --workspace --tests
+
+  license-headers:
+    name: SPDX license headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: apache/skywalking-eyes/header@v0.6.0
+        with:
+          config: .licenserc.yaml
+          mode: check
+
+  typos:
+    name: typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@master
+
+  test:
+    name: cargo test --workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install vendor/xgrammar-rs build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+      - name: Generate libcuda.so stub for no-GPU linking
+        # spark-storage uses raw `extern "C"` FFI to libcuda (cuStreamCreate
+        # etc.). Without libcuda on the runner the linker fails with
+        # `undefined reference to cu*` even though `ATLAS_SKIP_BUILD=1`
+        # avoids nvcc. We synthesize a stub `libcuda.so` whose symbols
+        # all return a non-zero CUDA error code (100 = CUDA_ERROR_NO_DEVICE)
+        # so any GPU test that *does* try to call cuInit fails-fast at
+        # runtime — matching what happens on a real no-GPU host. GPU tests
+        # are `#[ignore]`-gated so they never invoke these stubs in the
+        # default `cargo test` run; they're only here to satisfy the
+        # linker.
+        run: |
+          set -euo pipefail
+          cat > /tmp/libcuda_stub.c <<'EOF'
+          /* Stub for every CUDA driver API symbol that any Atlas crate
+           * links against (spark-storage, atlas-core::registry, cudarc).
+           * Each returns CUDA_ERROR_NO_DEVICE (100) so callers fail-fast.
+           * Generated for CI link-time only; never exercised at runtime
+           * because every test that touches these is #[ignore]-gated. */
+          /* Init / device / context */
+          int cuInit(unsigned int x) { (void)x; return 100; }
+          int cuDeviceGet(void *a, int b) { (void)a; (void)b; return 100; }
+          int cuCtxCreate(void **a, unsigned int b, int c) { (void)a; (void)b; (void)c; return 100; }
+          int cuCtxCreate_v2(void **a, unsigned int b, int c) { (void)a; (void)b; (void)c; return 100; }
+          int cuCtxDestroy_v2(void *a) { (void)a; return 100; }
+          int cuCtxGetCurrent(void **a) { (void)a; return 100; }
+          int cuCtxSetCurrent(void *a) { (void)a; return 100; }
+          /* Errors */
+          int cuGetErrorName(int code, const char **out) { (void)code; (void)out; return 100; }
+          int cuGetErrorString(int code, const char **out) { (void)code; (void)out; return 100; }
+          /* Streams */
+          int cuStreamCreate(void **a, unsigned int b) { (void)a; (void)b; return 100; }
+          int cuStreamDestroy_v2(void *a) { (void)a; return 100; }
+          int cuStreamSynchronize(void *a) { (void)a; return 100; }
+          int cuStreamBeginCapture(void *a, int b) { (void)a; (void)b; return 100; }
+          int cuStreamBeginCapture_v2(void *a, int b) { (void)a; (void)b; return 100; }
+          int cuStreamEndCapture(void *a, void **b) { (void)a; (void)b; return 100; }
+          int cuStreamWaitEvent(void *a, void *b, unsigned int c) { (void)a; (void)b; (void)c; return 100; }
+          /* Modules + launch */
+          int cuModuleLoadData(void **a, const void *b) { (void)a; (void)b; return 100; }
+          int cuModuleUnload(void *a) { (void)a; return 100; }
+          int cuModuleGetFunction(void **a, void *b, const char *c) { (void)a; (void)b; (void)c; return 100; }
+          int cuFuncSetAttribute(void *f, int attr, int val) { (void)f; (void)attr; (void)val; return 100; }
+          int cuLaunchKernel(void *f, unsigned int gx, unsigned int gy, unsigned int gz,
+                             unsigned int bx, unsigned int by, unsigned int bz,
+                             unsigned int sm, void *s, void **p, void **e) {
+              (void)f; (void)gx; (void)gy; (void)gz; (void)bx; (void)by; (void)bz;
+              (void)sm; (void)s; (void)p; (void)e; return 100;
+          }
+          /* Events */
+          int cuEventCreate(void **a, unsigned int b) { (void)a; (void)b; return 100; }
+          int cuEventDestroy_v2(void *a) { (void)a; return 100; }
+          int cuEventRecord(void *a, void *b) { (void)a; (void)b; return 100; }
+          int cuEventSynchronize(void *a) { (void)a; return 100; }
+          int cuEventElapsedTime(float *a, void *b, void *c) { (void)a; (void)b; (void)c; return 100; }
+          /* Memory — device */
+          int cuMemAlloc(unsigned long long *a, unsigned long b) { (void)a; (void)b; return 100; }
+          int cuMemAlloc_v2(unsigned long long *a, unsigned long b) { (void)a; (void)b; return 100; }
+          int cuMemAllocManaged(unsigned long long *a, unsigned long b, unsigned int c) {
+              (void)a; (void)b; (void)c; return 100;
+          }
+          int cuMemFree_v2(unsigned long long a) { (void)a; return 100; }
+          int cuMemGetInfo(unsigned long *a, unsigned long *b) { (void)a; (void)b; return 100; }
+          int cuMemGetInfo_v2(unsigned long *a, unsigned long *b) { (void)a; (void)b; return 100; }
+          /* Memory — host (pinned) */
+          int cuMemAllocHost(void **a, unsigned long b) { (void)a; (void)b; return 100; }
+          int cuMemAllocHost_v2(void **a, unsigned long b) { (void)a; (void)b; return 100; }
+          int cuMemFreeHost(void *a) { (void)a; return 100; }
+          /* Memcpy / memset */
+          int cuMemcpyHtoD(unsigned long long a, const void *b, unsigned long c) {
+              (void)a; (void)b; (void)c; return 100;
+          }
+          int cuMemcpyHtoD_v2(unsigned long long a, const void *b, unsigned long c) {
+              (void)a; (void)b; (void)c; return 100;
+          }
+          int cuMemcpyHtoDAsync(unsigned long long a, const void *b, unsigned long c, void *d) {
+              (void)a; (void)b; (void)c; (void)d; return 100;
+          }
+          int cuMemcpyHtoDAsync_v2(unsigned long long a, const void *b, unsigned long c, void *d) {
+              (void)a; (void)b; (void)c; (void)d; return 100;
+          }
+          int cuMemcpyDtoHAsync_v2(void *a, unsigned long long b, unsigned long c, void *d) {
+              (void)a; (void)b; (void)c; (void)d; return 100;
+          }
+          int cuMemcpyDtoDAsync_v2(unsigned long long a, unsigned long long b, unsigned long c, void *d) {
+              (void)a; (void)b; (void)c; (void)d; return 100;
+          }
+          int cuMemsetD8Async(unsigned long long a, unsigned char b, unsigned long c, void *d) {
+              (void)a; (void)b; (void)c; (void)d; return 100;
+          }
+          int cuMemsetD32Async(unsigned long long a, unsigned int b, unsigned long c, void *d) {
+              (void)a; (void)b; (void)c; (void)d; return 100;
+          }
+          /* Graphs */
+          int cuGraphInstantiateWithFlags(void **a, void *b, unsigned long long c) {
+              (void)a; (void)b; (void)c; return 100;
+          }
+          int cuGraphLaunch(void *a, void *b) { (void)a; (void)b; return 100; }
+          int cuGraphExecDestroy(void *a) { (void)a; return 100; }
+          int cuGraphDestroy(void *a) { (void)a; return 100; }
+          EOF
+          cc -shared -fPIC -nostdlib -o /tmp/libcuda.so /tmp/libcuda_stub.c
+          sudo install -m 0644 /tmp/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so
+          # Some build scripts also probe /usr/local/cuda/.../stubs
+          sudo mkdir -p /usr/local/cuda/targets/x86_64-linux/lib/stubs
+          sudo install -m 0644 /tmp/libcuda.so /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so
+      - name: Generate libnccl.so stub for no-GPU linking
+        # spark-comm links libnccl directly via `-lnccl`; without the
+        # library installed the test build fails at link time. Same
+        # treatment as libcuda: every nccl symbol returns a non-success
+        # code (2 = ncclSystemError) so any test that actually invokes
+        # NCCL fails-fast at runtime — and those tests are GPU-gated
+        # anyway. Stub purely satisfies the linker.
+        run: |
+          set -euo pipefail
+          cat > /tmp/libnccl_stub.c <<'EOF'
+          /* Stub for NCCL collective-communication symbols spark-comm
+           * links against. Each returns ncclSystemError (2) so any
+           * caller fails-fast; never invoked at runtime in default
+           * `cargo test` because every NCCL test is `#[ignore]`-gated. */
+          int ncclGetUniqueId(void *uid) { (void)uid; return 2; }
+          int ncclGetErrorString(int code) { (void)code; return 2; }
+          int ncclCommInitRank(void **comm, int n, void *uid, int rank) {
+              (void)comm; (void)n; (void)uid; (void)rank; return 2;
+          }
+          int ncclCommInitRankConfig(void **comm, int n, void *uid, int rank, void *config) {
+              (void)comm; (void)n; (void)uid; (void)rank; (void)config; return 2;
+          }
+          int ncclCommDestroy(void *comm) { (void)comm; return 2; }
+          int ncclCommAbort(void *comm) { (void)comm; return 2; }
+          int ncclCommGetAsyncError(void *comm, int *err) { (void)comm; (void)err; return 2; }
+          int ncclCommRegister(void *comm, void *p, unsigned long n, void **h) {
+              (void)comm; (void)p; (void)n; (void)h; return 2;
+          }
+          int ncclCommDeregister(void *comm, void *h) { (void)comm; (void)h; return 2; }
+          int ncclMemAlloc(void **p, unsigned long n) { (void)p; (void)n; return 2; }
+          int ncclMemFree(void *p) { (void)p; return 2; }
+          int ncclGroupStart(void) { return 2; }
+          int ncclGroupEnd(void) { return 2; }
+          int ncclSend(const void *p, unsigned long n, int dt, int peer, void *comm, void *s) {
+              (void)p; (void)n; (void)dt; (void)peer; (void)comm; (void)s; return 2;
+          }
+          int ncclRecv(void *p, unsigned long n, int dt, int peer, void *comm, void *s) {
+              (void)p; (void)n; (void)dt; (void)peer; (void)comm; (void)s; return 2;
+          }
+          int ncclAllReduce(const void *a, void *b, unsigned long n, int dt, int op, void *comm, void *s) {
+              (void)a; (void)b; (void)n; (void)dt; (void)op; (void)comm; (void)s; return 2;
+          }
+          int ncclAllGather(const void *a, void *b, unsigned long n, int dt, void *comm, void *s) {
+              (void)a; (void)b; (void)n; (void)dt; (void)comm; (void)s; return 2;
+          }
+          int ncclReduceScatter(const void *a, void *b, unsigned long n, int dt, int op, void *comm, void *s) {
+              (void)a; (void)b; (void)n; (void)dt; (void)op; (void)comm; (void)s; return 2;
+          }
+          int ncclBroadcast(const void *a, void *b, unsigned long n, int dt, int root, void *comm, void *s) {
+              (void)a; (void)b; (void)n; (void)dt; (void)root; (void)comm; (void)s; return 2;
+          }
+          EOF
+          cc -shared -fPIC -nostdlib -o /tmp/libnccl.so /tmp/libnccl_stub.c
+          sudo install -m 0644 /tmp/libnccl.so /usr/lib/x86_64-linux-gnu/libnccl.so
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Default `cargo test` skips `#[ignore]`-gated tests, which is
+      # exactly what we want — every test that requires a real GPU
+      # (spark-runtime, spark-storage, atlas-kernels, atlas-spark-bench
+      # correctness, spark-server integration) carries `#[ignore]` and
+      # is run locally on GB10 hardware via `-- --ignored`.
+      - run: cargo test --workspace --locked
+
+  # cargo-deny runs in security.yml with path filters on Cargo.toml / Cargo.lock /
+  # deny.toml plus a weekly cron. Not duplicated here.
