@@ -1,4 +1,7 @@
 <p align="center">
+  <img src="assets/logo.svg" alt="Atlas Inference Engine" width="640" />
+</p>
+<p align="center">
   <h1 align="center">Atlas Inference Engine</h1>
   <p align="center">
     <strong>Pure Rust LLM Inference</strong><br>
