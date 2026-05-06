@@ -90,26 +90,37 @@ pub fn detect(content: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Cargo runs unit tests in parallel threads within a single binary, and
+    // env vars are process-wide. `kill_switch_returns_none` mutates
+    // ATLAS_DISABLE_REFUSAL_DETECTION, so every test that calls `detect()`
+    // must hold this lock to avoid observing a transient kill-switch state.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn matches_canonical_refusal() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let r = detect("I cannot help with that request. Here is why…").unwrap();
         assert_eq!(r, "I cannot help with that request.");
     }
 
     #[test]
     fn matches_with_leading_whitespace() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let r = detect("   I'm sorry, but I can't assist with weapons design.").unwrap();
         assert_eq!(r, "I'm sorry, but I can't assist with weapons design.");
     }
 
     #[test]
     fn mixed_case_matches() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(detect("As AN ai, I cannot provide that.").is_some());
     }
 
     #[test]
     fn non_refusal_returns_none() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(detect("Sure, here's how to do that.").is_none());
         assert!(detect("").is_none());
         assert!(detect("I can do that for you.").is_none());
@@ -117,11 +128,13 @@ mod tests {
 
     #[test]
     fn kill_switch_returns_none() {
-        // SAFETY: single-threaded test; this env var isn't set elsewhere.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized via ENV_LOCK across this module's tests.
         unsafe {
             std::env::set_var("ATLAS_DISABLE_REFUSAL_DETECTION", "1");
         }
         let got = detect("I cannot help with that.");
+        // SAFETY: serialized via ENV_LOCK across this module's tests.
         unsafe {
             std::env::remove_var("ATLAS_DISABLE_REFUSAL_DETECTION");
         }
@@ -130,6 +143,7 @@ mod tests {
 
     #[test]
     fn no_terminator_falls_back_to_line() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let r = detect("I cannot answer that\nnext paragraph").unwrap();
         assert_eq!(r, "I cannot answer that");
     }
