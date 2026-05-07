@@ -1237,6 +1237,206 @@ mod tests {
         backend.free(y_ptr).unwrap();
     }
 
+    /// `attention_prefill` parity. Multi-token causal attention.
+    /// FP32 reference matches the kernel's algorithm exactly: causal
+    /// mask everything past `m`, max-subtract softmax, FP32 sum of
+    /// V-weighted scores. Verifies the (m, h) flat-grid decoding
+    /// inside the kernel.
+    #[test]
+    fn metal_attention_prefill_matches_reference() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        let num_tokens: u32 = 5;
+        let seq_len: u32 = 5; // K/V align with Q in this test
+        let num_heads: u32 = 4;
+        let num_kv_heads: u32 = 2;
+        let head_dim: u32 = 8;
+        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+
+        let q: Vec<half::bf16> = (0..(num_tokens * num_heads * head_dim))
+            .map(|i| half::bf16::from_f32(0.05 + 0.005 * i as f32))
+            .collect();
+        let k: Vec<half::bf16> = (0..(seq_len * num_kv_heads * head_dim))
+            .map(|i| half::bf16::from_f32(0.04 + 0.003 * i as f32))
+            .collect();
+        let v: Vec<half::bf16> = (0..(seq_len * num_kv_heads * head_dim))
+            .map(|i| half::bf16::from_f32(0.5 + 0.001 * i as f32))
+            .collect();
+
+        let mut expected: Vec<half::bf16> =
+            vec![half::bf16::ZERO; (num_tokens * num_heads * head_dim) as usize];
+        let group = num_heads / num_kv_heads;
+        for m in 0..num_tokens as usize {
+            let cutoff = m + 1;
+            for h in 0..num_heads as usize {
+                let kv_h = h / group as usize;
+                let mut scores: Vec<f32> = (0..seq_len as usize)
+                    .map(|s| {
+                        if s >= cutoff {
+                            f32::NEG_INFINITY
+                        } else {
+                            let mut dot = 0.0f32;
+                            for d in 0..head_dim as usize {
+                                let qv = q[(m * num_heads as usize + h)
+                                    * head_dim as usize
+                                    + d]
+                                    .to_f32();
+                                let kvv = k[(s * num_kv_heads as usize + kv_h)
+                                    * head_dim as usize
+                                    + d]
+                                    .to_f32();
+                                dot += qv * kvv;
+                            }
+                            dot * scale
+                        }
+                    })
+                    .collect();
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                let inv = 1.0 / sum;
+                for d in 0..head_dim as usize {
+                    let mut acc = 0.0f32;
+                    for s in 0..seq_len as usize {
+                        let vv = v[(s * num_kv_heads as usize + kv_h)
+                            * head_dim as usize
+                            + d]
+                            .to_f32();
+                        acc += scores[s] * inv * vv;
+                    }
+                    expected[(m * num_heads as usize + h) * head_dim as usize + d] =
+                        half::bf16::from_f32(acc);
+                }
+            }
+        }
+
+        let q_bytes = bf16_slice_to_bytes(&q);
+        let k_bytes = bf16_slice_to_bytes(&k);
+        let v_bytes = bf16_slice_to_bytes(&v);
+        let q_ptr = backend.alloc(q_bytes.len()).unwrap();
+        let k_ptr = backend.alloc(k_bytes.len()).unwrap();
+        let v_ptr = backend.alloc(v_bytes.len()).unwrap();
+        let out_ptr = backend.alloc(q_bytes.len()).unwrap();
+        backend.copy_h2d(&q_bytes, q_ptr).unwrap();
+        backend.copy_h2d(&k_bytes, k_ptr).unwrap();
+        backend.copy_h2d(&v_bytes, v_ptr).unwrap();
+
+        let kernel = backend
+            .kernel("attention_prefill", "attention_prefill")
+            .unwrap();
+        // Flat 1-D grid: num_heads * num_tokens threadgroups.
+        let total_groups = num_heads * num_tokens;
+        backend
+            .launch_typed(
+                kernel,
+                [total_groups, 1, 1],
+                [32, 1, 1],
+                0,
+                backend.default_stream(),
+                &[
+                    KernelArg::Bytes(&num_tokens.to_le_bytes()),
+                    KernelArg::Bytes(&seq_len.to_le_bytes()),
+                    KernelArg::Bytes(&num_heads.to_le_bytes()),
+                    KernelArg::Bytes(&num_kv_heads.to_le_bytes()),
+                    KernelArg::Bytes(&head_dim.to_le_bytes()),
+                    KernelArg::Bytes(&scale.to_le_bytes()),
+                    KernelArg::Buffer(q_ptr),
+                    KernelArg::Buffer(k_ptr),
+                    KernelArg::Buffer(v_ptr),
+                    KernelArg::Buffer(out_ptr),
+                ],
+            )
+            .expect("launch attention_prefill");
+        backend.synchronize(backend.default_stream()).unwrap();
+
+        let mut out_raw = vec![0u8; q_bytes.len()];
+        backend.copy_d2h(out_ptr, &mut out_raw).unwrap();
+        let actual = bytes_to_bf16_vec(&out_raw);
+
+        let mut max_abs_diff: f32 = 0.0;
+        for i in 0..(num_tokens * num_heads * head_dim) as usize {
+            let e = expected[i].to_f32();
+            let a = actual[i].to_f32();
+            let d = (e - a).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+            }
+        }
+        assert!(
+            max_abs_diff < 0.02,
+            "attention_prefill: max |expected - actual| = {max_abs_diff}"
+        );
+
+        backend.free(q_ptr).unwrap();
+        backend.free(k_ptr).unwrap();
+        backend.free(v_ptr).unwrap();
+        backend.free(out_ptr).unwrap();
+    }
+
+    /// `softmax_topp` correctness. Plant a winner-takes-all logit
+    /// distribution (one token wildly larger than the rest) so any
+    /// sane top-p sampler must pick that token regardless of the
+    /// uniform sample. Independently of the `p` and `uniform`
+    /// parameters, the result has to be the planted index.
+    #[test]
+    fn metal_softmax_topp_dominant_logit() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        let vocab: u32 = 256;
+        let mut logits: Vec<half::bf16> = (0..vocab)
+            .map(|i| half::bf16::from_f32(-2.0 + 0.001 * i as f32))
+            .collect();
+        let target_idx = 137usize;
+        // 30 logit units at temperature 1.0 → softmax mass essentially 1.
+        logits[target_idx] = half::bf16::from_f32(30.0);
+
+        let bytes = bf16_slice_to_bytes(&logits);
+        let logits_ptr = backend.alloc(bytes.len()).unwrap();
+        let result_ptr = backend.alloc(4).unwrap();
+        backend.copy_h2d(&bytes, logits_ptr).unwrap();
+
+        let kernel = backend.kernel("softmax_topp", "softmax_topp").unwrap();
+        // Try a few (p, uniform) combinations — none should change
+        // the result given the dominant logit.
+        for &(p, uniform) in &[(0.9f32, 0.1f32), (0.95, 0.5), (1.0, 0.99)] {
+            let temp: f32 = 1.0;
+            backend
+                .launch_typed(
+                    kernel,
+                    [1, 1, 1],
+                    [128, 1, 1],
+                    0,
+                    backend.default_stream(),
+                    &[
+                        KernelArg::Bytes(&vocab.to_le_bytes()),
+                        KernelArg::Bytes(&temp.to_le_bytes()),
+                        KernelArg::Bytes(&p.to_le_bytes()),
+                        KernelArg::Bytes(&uniform.to_le_bytes()),
+                        KernelArg::Buffer(logits_ptr),
+                        KernelArg::Buffer(result_ptr),
+                    ],
+                )
+                .expect("launch softmax_topp");
+            backend.synchronize(backend.default_stream()).unwrap();
+
+            let mut result_raw = [0u8; 4];
+            backend.copy_d2h(result_ptr, &mut result_raw).unwrap();
+            let actual = u32::from_le_bytes(result_raw) as usize;
+            assert_eq!(
+                actual, target_idx,
+                "softmax_topp: p={p}, uniform={uniform}: expected {target_idx}, got {actual}"
+            );
+        }
+
+        backend.free(logits_ptr).unwrap();
+        backend.free(result_ptr).unwrap();
+    }
+
     /// `kv_cache_append` parity. Writes a single token's K and V
     /// projections at slot `cache_pos` and verifies the cache
     /// updates exactly there, with neighbouring slots untouched.
