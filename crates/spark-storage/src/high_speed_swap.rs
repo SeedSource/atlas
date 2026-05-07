@@ -17,16 +17,9 @@ use crate::predictor::{Predictor, PredictorDims};
 use crate::scratch_pool::{ScratchDims, ScratchPool};
 use crate::tiled_attention::{TiledAttention, TiledAttentionDims};
 
-/// Per-call dimensions describing the model the orchestrator serves.
-#[derive(Clone, Copy, Debug)]
-pub struct ModelDims {
-    pub num_layers: u32,
-    pub max_blocks_per_layer: u32,
-    pub num_q_heads: u16,
-    pub num_kv_heads: u16,
-    pub head_dim: u16,
-    pub block_size: u16,
-}
+// `ModelDims` lives in `crate::model_dims` so it stays available on
+// non-cuda builds where the swap orchestrator below isn't compiled.
+pub use crate::model_dims::ModelDims;
 
 pub struct HighSpeedSwap {
     cfg: HighSpeedSwapConfig,

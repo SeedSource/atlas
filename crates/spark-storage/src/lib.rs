@@ -35,8 +35,16 @@ pub mod attention_ref;
 pub mod config;
 pub mod eviction;
 pub mod group;
+pub mod model_dims;
 pub mod predictor_ref;
 pub mod projection;
+
+// `ModelDims` is a plain POD struct (no GPU state) that
+// `spark-model`'s public surface threads through every layer's
+// forward signature; it must stay reachable on metal builds even
+// though the high-speed-swap orchestrator that consumes it is
+// CUDA-gated.
+pub use model_dims::ModelDims;
 
 // `layout` opens disk files with `O_DIRECT` and pre-allocates via
 // `posix_fallocate` — both Linux-specific. Only the cuda-side modules
@@ -68,7 +76,7 @@ pub use backend::{IoUringBackend, PosixBackend, ReadRequest, StorageBackend};
 pub use config::HighSpeedSwapConfig;
 pub use eviction::EvictionPolicy;
 #[cfg(feature = "cuda")]
-pub use high_speed_swap::{HighSpeedSwap, ModelDims, install_local, local_installed, with_local};
+pub use high_speed_swap::{HighSpeedSwap, install_local, local_installed, with_local};
 
 #[cfg(feature = "cuda")]
 pub use predictor::{Predictor, PredictorDims};

@@ -11,8 +11,8 @@ default = ["cuda"]
 # forwards atlas-core/cuda + spark-runtime/cuda so the default Linux build
 # remains unchanged after the workspace-level default-features = false on
 # atlas-core.
-cuda = ["atlas-core/cuda", "spark-runtime/cuda"]
-metal = ["atlas-core/metal", "spark-runtime/metal"]
+cuda = ["atlas-core/cuda", "spark-runtime/cuda", "spark-storage/cuda"]
+metal = ["atlas-core/metal", "spark-runtime/metal", "spark-storage/metal"]
 
 [dependencies]
 atlas-core = { workspace = true }
@@ -22,7 +22,9 @@ atlas-kernels = { workspace = true }
 # re-enables cudarc on every build.
 spark-runtime = { path = "../spark-runtime", default-features = false }
 spark-comm = { path = "../spark-comm" }
-spark-storage = { path = "../spark-storage" }
+# Same opt-out pattern as spark-runtime above — keeps metal builds
+# from silently re-enabling spark-storage's cuda default.
+spark-storage = { path = "../spark-storage", default-features = false }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
