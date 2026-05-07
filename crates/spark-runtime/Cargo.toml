@@ -23,6 +23,16 @@ name = "bench_fast_weights"
 path = "benches/bench_fast_weights.rs"
 required-features = ["test-utils"]
 
+# Standalone smoke binary for the metal backend. Loads layer 3 of
+# `mlx-community/Qwen3.5-4B-MLX-8bit` from `~/models/...` (override
+# via `$ATLAS_MLX_MODEL_DIR`) and runs a single full-attention
+# block forward pass. Prints output statistics so users can verify
+# their Apple Silicon build runs real kernels on real weights.
+[[example]]
+name = "metal_layer3_attention"
+path = "examples/metal_layer3_attention.rs"
+required-features = ["metal"]
+
 # Integration test gated by `test-utils` because it depends on the
 # `gpu::mock` module, which is itself `cfg(any(test, feature = "test-utils"))`.
 # Without this gate, default `cargo test --workspace` would attempt to compile
