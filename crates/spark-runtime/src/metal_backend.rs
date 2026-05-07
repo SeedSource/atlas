@@ -972,6 +972,321 @@ mod tests {
         backend.free(out_ptr).unwrap();
     }
 
+    /// Build a synthetic MLX-int8 (packed, scales, biases) triplet
+    /// + the matching dequantized BF16 weight matrix. Returned tuple:
+    /// (packed_bytes_le, scales_bytes_le, biases_bytes_le, w_bf16_dequant).
+    fn build_mlx_fixture(
+        n_rows: usize,
+        n_cols: usize,
+        group_size: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<half::bf16>) {
+        assert!(n_cols % 4 == 0 && n_cols % group_size == 0);
+        let groups_per_row = n_cols / group_size;
+
+        let mut bytes_flat: Vec<u8> = Vec::with_capacity(n_rows * n_cols);
+        for r in 0..n_rows {
+            for c in 0..n_cols {
+                bytes_flat.push(((r * 13 + c * 5 + 17) % 256) as u8);
+            }
+        }
+        let mut packed: Vec<u32> = Vec::with_capacity(n_rows * n_cols / 4);
+        for r in 0..n_rows {
+            for c in (0..n_cols).step_by(4) {
+                let base = r * n_cols + c;
+                let word = (bytes_flat[base] as u32)
+                    | ((bytes_flat[base + 1] as u32) << 8)
+                    | ((bytes_flat[base + 2] as u32) << 16)
+                    | ((bytes_flat[base + 3] as u32) << 24);
+                packed.push(word);
+            }
+        }
+        let mut scales: Vec<half::bf16> = Vec::with_capacity(n_rows * groups_per_row);
+        let mut biases: Vec<half::bf16> = Vec::with_capacity(n_rows * groups_per_row);
+        for r in 0..n_rows {
+            for g in 0..groups_per_row {
+                scales.push(half::bf16::from_f32(
+                    0.001 + 0.0005 * r as f32 + 0.0007 * g as f32,
+                ));
+                biases.push(half::bf16::from_f32(
+                    -0.05 + 0.01 * r as f32 + 0.005 * g as f32,
+                ));
+            }
+        }
+
+        let mut w_dequant: Vec<half::bf16> = vec![half::bf16::ZERO; n_rows * n_cols];
+        for r in 0..n_rows {
+            for c in 0..n_cols {
+                let byte = bytes_flat[r * n_cols + c] as f32;
+                let g = c / group_size;
+                let s = scales[r * groups_per_row + g].to_f32();
+                let b = biases[r * groups_per_row + g].to_f32();
+                w_dequant[r * n_cols + c] = half::bf16::from_f32(byte * s + b);
+            }
+        }
+        (
+            u32_slice_to_bytes(&packed),
+            bf16_slice_to_bytes(&scales),
+            bf16_slice_to_bytes(&biases),
+            w_dequant,
+        )
+    }
+
+    /// `mlx_int8_gemv` parity. Build a synthetic weight + a known
+    /// activation vector, run the fused decode kernel, compare to
+    /// the FP32-accumulated CPU reference. Exercises the threadgroup
+    /// + simdgroup reduction path that materializes one row of `y`.
+    #[test]
+    fn metal_mlx_int8_gemv_matches_reference() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        // Pick an N × K shape that exercises real reduction depth.
+        // K=256 spans 4 groups per row (group_size=64) and 8 simd
+        // lanes' worth of work at 32 threads/group.
+        let n: u32 = 8;
+        let k: u32 = 256;
+        let group_size: u32 = 64;
+
+        let (packed_bytes, scales_bytes, biases_bytes, w_ref) =
+            build_mlx_fixture(n as usize, k as usize, group_size as usize);
+
+        // Activation: a smooth, deterministic vector small enough that
+        // `byte * scale ~ 0.05` * `x ~ 0.5` ≈ 0.025 per term — keeps
+        // the K-element accumulation in a comfortable BF16 range.
+        let x_bf16: Vec<half::bf16> = (0..k)
+            .map(|i| half::bf16::from_f32(0.5 + 0.001 * i as f32))
+            .collect();
+        let x_bytes = bf16_slice_to_bytes(&x_bf16);
+
+        // CPU reference (FP32 accumulation matches the kernel).
+        let mut expected: Vec<half::bf16> = vec![half::bf16::ZERO; n as usize];
+        for r in 0..n as usize {
+            let mut acc: f32 = 0.0;
+            for c in 0..k as usize {
+                acc += w_ref[r * k as usize + c].to_f32() * x_bf16[c].to_f32();
+            }
+            expected[r] = half::bf16::from_f32(acc);
+        }
+
+        let packed_ptr = backend.alloc(packed_bytes.len()).unwrap();
+        let scales_ptr = backend.alloc(scales_bytes.len()).unwrap();
+        let biases_ptr = backend.alloc(biases_bytes.len()).unwrap();
+        let x_ptr = backend.alloc(x_bytes.len()).unwrap();
+        let y_ptr = backend.alloc(n as usize * 2).unwrap();
+        backend.copy_h2d(&packed_bytes, packed_ptr).unwrap();
+        backend.copy_h2d(&scales_bytes, scales_ptr).unwrap();
+        backend.copy_h2d(&biases_bytes, biases_ptr).unwrap();
+        backend.copy_h2d(&x_bytes, x_ptr).unwrap();
+
+        let kernel = backend.kernel("mlx_int8_gemv", "mlx_int8_gemv").unwrap();
+        // 64 threads/group → two simdgroups, exercises the
+        // cross-simdgroup reduction in shared memory.
+        let threads_per_tg: u32 = 64;
+        backend
+            .launch_typed(
+                kernel,
+                [n, 1, 1],
+                [threads_per_tg, 1, 1],
+                0,
+                backend.default_stream(),
+                &[
+                    KernelArg::Bytes(&n.to_le_bytes()),
+                    KernelArg::Bytes(&k.to_le_bytes()),
+                    KernelArg::Bytes(&group_size.to_le_bytes()),
+                    KernelArg::Buffer(packed_ptr),
+                    KernelArg::Buffer(scales_ptr),
+                    KernelArg::Buffer(biases_ptr),
+                    KernelArg::Buffer(x_ptr),
+                    KernelArg::Buffer(y_ptr),
+                ],
+            )
+            .expect("launch_typed gemv");
+        backend.synchronize(backend.default_stream()).unwrap();
+
+        let mut y_raw = vec![0u8; n as usize * 2];
+        backend.copy_d2h(y_ptr, &mut y_raw).unwrap();
+        let actual = bytes_to_bf16_vec(&y_raw);
+
+        // 256-element BF16 sum at result magnitude ~0.5 has ULP ≈ 0.004;
+        // tolerate 0.05 for accumulator-order drift across simdgroups.
+        let mut max_abs_diff: f32 = 0.0;
+        for i in 0..n as usize {
+            let e = expected[i].to_f32();
+            let a = actual[i].to_f32();
+            let d = (e - a).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+            }
+        }
+        assert!(
+            max_abs_diff < 0.05,
+            "mlx_int8_gemv: max |expected - actual| = {max_abs_diff}; \
+             expected/actual head: {:?} vs {:?}",
+            &expected.iter().take(4).map(|v| v.to_f32()).collect::<Vec<_>>(),
+            &actual.iter().take(4).map(|v| v.to_f32()).collect::<Vec<_>>()
+        );
+
+        backend.free(packed_ptr).unwrap();
+        backend.free(scales_ptr).unwrap();
+        backend.free(biases_ptr).unwrap();
+        backend.free(x_ptr).unwrap();
+        backend.free(y_ptr).unwrap();
+    }
+
+    /// `mlx_int8_gemm` parity. Two-token prefill against the same
+    /// synthetic weight as the gemv test. Verifies the (m, n) thread
+    /// grid covers the output correctly and the K-loop accumulation
+    /// matches the row-by-row fused-dequant path.
+    #[test]
+    fn metal_mlx_int8_gemm_matches_reference() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        let m: u32 = 2;
+        let n: u32 = 8;
+        let k: u32 = 128;
+        let group_size: u32 = 64;
+
+        let (packed_bytes, scales_bytes, biases_bytes, w_ref) =
+            build_mlx_fixture(n as usize, k as usize, group_size as usize);
+
+        // X: m rows × k cols, each row a slightly different smooth
+        // pattern so per-row mismatches surface clearly.
+        let x_bf16: Vec<half::bf16> = (0..(m * k))
+            .map(|i| {
+                let row = i / k;
+                let col = i % k;
+                half::bf16::from_f32(
+                    0.3 + 0.01 * row as f32 + 0.001 * col as f32,
+                )
+            })
+            .collect();
+        let x_bytes = bf16_slice_to_bytes(&x_bf16);
+
+        // CPU reference: Y[mi, ni] = sum_k X[mi, k] * W[ni, k]
+        let mut expected: Vec<half::bf16> =
+            vec![half::bf16::ZERO; (m * n) as usize];
+        for mi in 0..m as usize {
+            for ni in 0..n as usize {
+                let mut acc: f32 = 0.0;
+                for ki in 0..k as usize {
+                    acc += x_bf16[mi * k as usize + ki].to_f32()
+                        * w_ref[ni * k as usize + ki].to_f32();
+                }
+                expected[mi * n as usize + ni] = half::bf16::from_f32(acc);
+            }
+        }
+
+        let packed_ptr = backend.alloc(packed_bytes.len()).unwrap();
+        let scales_ptr = backend.alloc(scales_bytes.len()).unwrap();
+        let biases_ptr = backend.alloc(biases_bytes.len()).unwrap();
+        let x_ptr = backend.alloc(x_bytes.len()).unwrap();
+        let y_ptr = backend.alloc((m * n) as usize * 2).unwrap();
+        backend.copy_h2d(&packed_bytes, packed_ptr).unwrap();
+        backend.copy_h2d(&scales_bytes, scales_ptr).unwrap();
+        backend.copy_h2d(&biases_bytes, biases_ptr).unwrap();
+        backend.copy_h2d(&x_bytes, x_ptr).unwrap();
+
+        let kernel = backend.kernel("mlx_int8_gemm", "mlx_int8_gemm").unwrap();
+        let block_x = 16u32;
+        let block_y = 16u32;
+        backend
+            .launch_typed(
+                kernel,
+                [n.div_ceil(block_x), m.div_ceil(block_y), 1],
+                [block_x, block_y, 1],
+                0,
+                backend.default_stream(),
+                &[
+                    KernelArg::Bytes(&m.to_le_bytes()),
+                    KernelArg::Bytes(&n.to_le_bytes()),
+                    KernelArg::Bytes(&k.to_le_bytes()),
+                    KernelArg::Bytes(&group_size.to_le_bytes()),
+                    KernelArg::Buffer(x_ptr),
+                    KernelArg::Buffer(packed_ptr),
+                    KernelArg::Buffer(scales_ptr),
+                    KernelArg::Buffer(biases_ptr),
+                    KernelArg::Buffer(y_ptr),
+                ],
+            )
+            .expect("launch_typed gemm");
+        backend.synchronize(backend.default_stream()).unwrap();
+
+        let mut y_raw = vec![0u8; (m * n) as usize * 2];
+        backend.copy_d2h(y_ptr, &mut y_raw).unwrap();
+        let actual = bytes_to_bf16_vec(&y_raw);
+
+        let mut max_abs_diff: f32 = 0.0;
+        for i in 0..(m * n) as usize {
+            let e = expected[i].to_f32();
+            let a = actual[i].to_f32();
+            let d = (e - a).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+            }
+        }
+        assert!(
+            max_abs_diff < 0.05,
+            "mlx_int8_gemm: max |expected - actual| = {max_abs_diff}"
+        );
+
+        backend.free(packed_ptr).unwrap();
+        backend.free(scales_ptr).unwrap();
+        backend.free(biases_ptr).unwrap();
+        backend.free(x_ptr).unwrap();
+        backend.free(y_ptr).unwrap();
+    }
+
+    /// `argmax_bf16` parity. Plant a known-largest value at a known
+    /// index; verify both the value and the index — the
+    /// simd_shuffle_xor reduction is easy to get subtly wrong.
+    #[test]
+    fn metal_argmax_bf16_matches_reference() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        let n: u32 = 1024;
+        let mut values: Vec<half::bf16> = (0..n)
+            .map(|i| half::bf16::from_f32(0.001 * i as f32))
+            .collect();
+        // Plant a maximum at a random-looking, non-edge index.
+        let target_idx = 723usize;
+        values[target_idx] = half::bf16::from_f32(99.0);
+
+        let bytes = bf16_slice_to_bytes(&values);
+        let logits_ptr = backend.alloc(bytes.len()).unwrap();
+        let result_ptr = backend.alloc(4).unwrap(); // u32
+        backend.copy_h2d(&bytes, logits_ptr).unwrap();
+
+        let kernel = backend.kernel("argmax_bf16", "argmax_bf16").unwrap();
+        backend
+            .launch_typed(
+                kernel,
+                [1, 1, 1],
+                [128, 1, 1], // 4 simdgroups
+                0,
+                backend.default_stream(),
+                &[
+                    KernelArg::Bytes(&n.to_le_bytes()),
+                    KernelArg::Buffer(logits_ptr),
+                    KernelArg::Buffer(result_ptr),
+                ],
+            )
+            .expect("launch_typed argmax");
+        backend.synchronize(backend.default_stream()).unwrap();
+
+        let mut result_raw = [0u8; 4];
+        backend.copy_d2h(result_ptr, &mut result_raw).unwrap();
+        let actual_idx = u32::from_le_bytes(result_raw) as usize;
+        assert_eq!(
+            actual_idx, target_idx,
+            "argmax: expected {target_idx}, got {actual_idx}"
+        );
+
+        backend.free(logits_ptr).unwrap();
+        backend.free(result_ptr).unwrap();
+    }
+
     /// Real-data parity check. Loads the actual `embed_tokens` triplet
     /// from a local copy of `mlx-community/Qwen3.5-4B-MLX-8bit`,
     /// dequantizes a 4-row × 128-col slice via the Metal kernel, and
