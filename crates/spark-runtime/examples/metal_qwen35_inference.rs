@@ -111,6 +111,232 @@ impl FullAttentionLayer {
     }
 }
 
+// ── Linear-attention (GDN) dims ────────────────────────────────
+const NUM_K_HEADS_LIN: u32 = 16;
+const NUM_V_HEADS_LIN: u32 = 32;
+const K_HEAD_DIM_LIN: u32 = 128;
+const V_HEAD_DIM_LIN: u32 = 128;
+const QKV_TOTAL_LIN: u32 = 8192; // = K_HEADS*K_DIM + K_HEADS*K_DIM + V_HEADS*V_DIM = 2048+2048+4096
+const Z_DIM_LIN: u32 = 4096; // = NUM_V_HEADS_LIN * V_HEAD_DIM_LIN
+const NUM_STATE_HEADS: u32 = 32;
+const CONV_KERNEL_SIZE: u32 = 4;
+
+/// Per-layer weights for a `linear_attention` (GDN) layer.
+struct LinearAttentionLayer {
+    input_ln: DevicePtr,
+    a_log: DevicePtr,        // F32 [num_state_heads]
+    dt_bias: DevicePtr,      // BF16 [num_state_heads]
+    conv1d_weight: DevicePtr, // BF16 [QKV_TOTAL_LIN, kernel_size]
+    in_proj_a: MlxInt8Weight,
+    in_proj_b: MlxInt8Weight,
+    in_proj_qkv: MlxInt8Weight,
+    in_proj_z: MlxInt8Weight,
+    norm_weight: DevicePtr,  // BF16 [V_HEAD_DIM_LIN]
+    out_proj: MlxInt8Weight,
+}
+
+impl LinearAttentionLayer {
+    fn load(backend: &MetalGpuBackend, st: &SafeTensors, layer_idx: u32) -> Result<Self> {
+        let prefix = format!("language_model.model.layers.{layer_idx}");
+        let load_raw = |name: &str| -> Result<DevicePtr> {
+            let t = st
+                .tensor(name)
+                .with_context(|| format!("missing {name}"))?;
+            let p = backend.alloc(t.data().len())?;
+            backend.copy_h2d(t.data(), p)?;
+            Ok(p)
+        };
+        Ok(Self {
+            input_ln: load_raw(&format!("{prefix}.input_layernorm.weight"))?,
+            a_log: load_raw(&format!("{prefix}.linear_attn.A_log"))?,
+            dt_bias: load_raw(&format!("{prefix}.linear_attn.dt_bias"))?,
+            conv1d_weight: load_raw(&format!("{prefix}.linear_attn.conv1d.weight"))?,
+            in_proj_a: MlxInt8Weight::load(backend, st, &format!("{prefix}.linear_attn.in_proj_a"), GROUP_SIZE)?,
+            in_proj_b: MlxInt8Weight::load(backend, st, &format!("{prefix}.linear_attn.in_proj_b"), GROUP_SIZE)?,
+            in_proj_qkv: MlxInt8Weight::load(backend, st, &format!("{prefix}.linear_attn.in_proj_qkv"), GROUP_SIZE)?,
+            in_proj_z: MlxInt8Weight::load(backend, st, &format!("{prefix}.linear_attn.in_proj_z"), GROUP_SIZE)?,
+            norm_weight: load_raw(&format!("{prefix}.linear_attn.norm.weight"))?,
+            out_proj: MlxInt8Weight::load(backend, st, &format!("{prefix}.linear_attn.out_proj"), GROUP_SIZE)?,
+        })
+    }
+}
+
+/// Per-layer SSM/conv state for a linear-attention layer.
+struct LinearAttentionState {
+    /// BF16 [QKV_TOTAL_LIN, kernel_size - 1]. Persists across tokens.
+    conv1d_state: DevicePtr,
+    /// FP32 [batch=1, num_v_heads, k_dim, v_dim]. Persists across tokens.
+    gdn_state: DevicePtr,
+}
+
+impl LinearAttentionState {
+    fn alloc(backend: &MetalGpuBackend) -> Result<Self> {
+        let conv_state_bytes = (QKV_TOTAL_LIN * (CONV_KERNEL_SIZE - 1)) as usize * 2;
+        let gdn_state_floats = (NUM_V_HEADS_LIN * K_HEAD_DIM_LIN * V_HEAD_DIM_LIN) as usize;
+        let conv_ptr = backend.alloc(conv_state_bytes)?;
+        let gdn_ptr = backend.alloc(gdn_state_floats * 4)?;
+        backend.memset(conv_ptr, 0, conv_state_bytes)?;
+        backend.memset(gdn_ptr, 0, gdn_state_floats * 4)?;
+        Ok(Self {
+            conv1d_state: conv_ptr,
+            gdn_state: gdn_ptr,
+        })
+    }
+}
+
+/// Per-call scratch buffers for the linear-attention forward.
+struct LinScratch {
+    x_norm: DevicePtr,     // BF16 [HIDDEN]
+    dt_raw: DevicePtr,     // BF16 [num_state_heads]
+    b_raw: DevicePtr,      // BF16 [num_state_heads]
+    qkv: DevicePtr,        // BF16 [QKV_TOTAL_LIN] pre-conv
+    qkv_smooth: DevicePtr, // BF16 [QKV_TOTAL_LIN] post-conv
+    z: DevicePtr,          // BF16 [Z_DIM_LIN]
+    gate: DevicePtr,       // F32 [num_state_heads]
+    beta: DevicePtr,       // F32 [num_state_heads]
+    y: DevicePtr,          // BF16 [Z_DIM_LIN]
+    y_norm: DevicePtr,     // BF16 [Z_DIM_LIN]
+    z_silu: DevicePtr,     // BF16 [Z_DIM_LIN]
+    y_gated: DevicePtr,    // BF16 [Z_DIM_LIN]
+    out: DevicePtr,        // BF16 [HIDDEN]
+    x_resid: DevicePtr,    // BF16 [HIDDEN]
+}
+
+fn alloc_lin_scratch(backend: &MetalGpuBackend) -> Result<LinScratch> {
+    let alloc_bf16 = |n: u32| -> Result<DevicePtr> { Ok(backend.alloc(n as usize * 2)?) };
+    let alloc_f32 = |n: u32| -> Result<DevicePtr> { Ok(backend.alloc(n as usize * 4)?) };
+    Ok(LinScratch {
+        x_norm: alloc_bf16(HIDDEN)?,
+        dt_raw: alloc_bf16(NUM_STATE_HEADS)?,
+        b_raw: alloc_bf16(NUM_STATE_HEADS)?,
+        qkv: alloc_bf16(QKV_TOTAL_LIN)?,
+        qkv_smooth: alloc_bf16(QKV_TOTAL_LIN)?,
+        z: alloc_bf16(Z_DIM_LIN)?,
+        gate: alloc_f32(NUM_STATE_HEADS)?,
+        beta: alloc_f32(NUM_STATE_HEADS)?,
+        y: alloc_bf16(Z_DIM_LIN)?,
+        y_norm: alloc_bf16(Z_DIM_LIN)?,
+        z_silu: alloc_bf16(Z_DIM_LIN)?,
+        y_gated: alloc_bf16(Z_DIM_LIN)?,
+        out: alloc_bf16(HIDDEN)?,
+        x_resid: alloc_bf16(HIDDEN)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_linear_attention(
+    backend: &MetalGpuBackend,
+    layer: &LinearAttentionLayer,
+    state: &LinearAttentionState,
+    scratch: &LinScratch,
+    rms: spark_runtime::gpu::KernelHandle,
+    conv1d: spark_runtime::gpu::KernelHandle,
+    gdn_gate: spark_runtime::gpu::KernelHandle,
+    sigmoid: spark_runtime::gpu::KernelHandle,
+    silu_op: spark_runtime::gpu::KernelHandle,
+    mul: spark_runtime::gpu::KernelHandle,
+    gdn_dec: spark_runtime::gpu::KernelHandle,
+    add: spark_runtime::gpu::KernelHandle,
+    x_in: DevicePtr,
+    x_buf: DevicePtr,
+    stream: u64,
+) -> Result<DevicePtr> {
+    // 1. norm
+    backend.launch_typed(rms, [1, 1, 1], [128, 1, 1], 0, stream, &[
+        KernelArg::Bytes(&HIDDEN.to_le_bytes()),
+        KernelArg::Bytes(&RMS_EPS.to_le_bytes()),
+        KernelArg::Buffer(x_in), KernelArg::Buffer(layer.input_ln), KernelArg::Buffer(scratch.x_norm),
+    ])?;
+    // 2. projections
+    layer.in_proj_a.gemv(backend, scratch.x_norm, scratch.dt_raw, stream)?;
+    layer.in_proj_b.gemv(backend, scratch.x_norm, scratch.b_raw, stream)?;
+    layer.in_proj_qkv.gemv(backend, scratch.x_norm, scratch.qkv, stream)?;
+    layer.in_proj_z.gemv(backend, scratch.x_norm, scratch.z, stream)?;
+
+    // 3. causal conv1d on qkv (8192 channels, kernel_size 4)
+    backend.launch_typed(conv1d, [QKV_TOTAL_LIN.div_ceil(64), 1, 1], [64, 1, 1], 0, stream, &[
+        KernelArg::Bytes(&QKV_TOTAL_LIN.to_le_bytes()),
+        KernelArg::Bytes(&CONV_KERNEL_SIZE.to_le_bytes()),
+        KernelArg::Buffer(layer.conv1d_weight),
+        KernelArg::Buffer(scratch.qkv),
+        KernelArg::Buffer(state.conv1d_state),
+        KernelArg::Buffer(scratch.qkv_smooth),
+    ])?;
+
+    // 4. gate = exp(softplus(dt + dt_bias) * -exp(A_log))
+    backend.launch_typed(gdn_gate, [NUM_STATE_HEADS.div_ceil(32), 1, 1], [32, 1, 1], 0, stream, &[
+        KernelArg::Bytes(&NUM_STATE_HEADS.to_le_bytes()),
+        KernelArg::Buffer(scratch.dt_raw),
+        KernelArg::Buffer(layer.dt_bias),
+        KernelArg::Buffer(layer.a_log),
+        KernelArg::Buffer(scratch.gate),
+    ])?;
+    // 5. beta = sigmoid(b_raw) → FP32
+    backend.launch_typed(sigmoid, [NUM_STATE_HEADS.div_ceil(32), 1, 1], [32, 1, 1], 0, stream, &[
+        KernelArg::Bytes(&NUM_STATE_HEADS.to_le_bytes()),
+        KernelArg::Buffer(scratch.b_raw),
+        KernelArg::Buffer(scratch.beta),
+    ])?;
+
+    // 6. Split qkv_smooth: Q[2048] | K[2048] | V[4096] sequential.
+    let q_offset = 0;
+    let k_offset = (NUM_K_HEADS_LIN * K_HEAD_DIM_LIN) as usize * 2; // 2048 BF16 = 4096B
+    let v_offset = (2 * NUM_K_HEADS_LIN * K_HEAD_DIM_LIN) as usize * 2; // 4096 BF16 = 8192B
+    let q_view = scratch.qkv_smooth.offset(q_offset);
+    let k_view = scratch.qkv_smooth.offset(k_offset);
+    let v_view = scratch.qkv_smooth.offset(v_offset);
+
+    // 7. gated_delta_rule_decode
+    let batch_size = 1u32;
+    let total_groups = NUM_V_HEADS_LIN * batch_size;
+    backend.launch_typed(gdn_dec, [total_groups, 1, 1], [128, 1, 1], 0, stream, &[
+        KernelArg::Buffer(state.gdn_state),
+        KernelArg::Buffer(q_view),
+        KernelArg::Buffer(k_view),
+        KernelArg::Buffer(v_view),
+        KernelArg::Buffer(scratch.gate),
+        KernelArg::Buffer(scratch.beta),
+        KernelArg::Buffer(scratch.y),
+        KernelArg::Bytes(&batch_size.to_le_bytes()),
+        KernelArg::Bytes(&NUM_K_HEADS_LIN.to_le_bytes()),
+        KernelArg::Bytes(&NUM_V_HEADS_LIN.to_le_bytes()),
+        KernelArg::Bytes(&K_HEAD_DIM_LIN.to_le_bytes()),
+        KernelArg::Bytes(&V_HEAD_DIM_LIN.to_le_bytes()),
+    ])?;
+
+    // 8. per-head rms_norm at head_dim=128 over Z_DIM_LIN/V_HEAD_DIM_LIN = 32 tokens
+    backend.launch_typed(rms, [NUM_V_HEADS_LIN, 1, 1], [128, 1, 1], 0, stream, &[
+        KernelArg::Bytes(&V_HEAD_DIM_LIN.to_le_bytes()),
+        KernelArg::Bytes(&RMS_EPS.to_le_bytes()),
+        KernelArg::Buffer(scratch.y), KernelArg::Buffer(layer.norm_weight), KernelArg::Buffer(scratch.y_norm),
+    ])?;
+
+    // 9. silu(z)
+    backend.launch_typed(silu_op, [Z_DIM_LIN.div_ceil(64), 1, 1], [64, 1, 1], 0, stream, &[
+        KernelArg::Bytes(&Z_DIM_LIN.to_le_bytes()),
+        KernelArg::Buffer(scratch.z), KernelArg::Buffer(scratch.z_silu),
+    ])?;
+
+    // 10. y_gated = silu(z) * y_norm
+    backend.launch_typed(mul, [Z_DIM_LIN.div_ceil(64), 1, 1], [64, 1, 1], 0, stream, &[
+        KernelArg::Bytes(&Z_DIM_LIN.to_le_bytes()),
+        KernelArg::Buffer(scratch.z_silu), KernelArg::Buffer(scratch.y_norm), KernelArg::Buffer(scratch.y_gated),
+    ])?;
+
+    // 11. out_proj
+    layer.out_proj.gemv(backend, scratch.y_gated, scratch.out, stream)?;
+
+    // 12. residual
+    backend.launch_typed(add, [HIDDEN.div_ceil(64), 1, 1], [64, 1, 1], 0, stream, &[
+        KernelArg::Bytes(&HIDDEN.to_le_bytes()),
+        KernelArg::Buffer(x_in), KernelArg::Buffer(scratch.out), KernelArg::Buffer(scratch.x_resid),
+    ])?;
+
+    // Copy to caller's stable x_buf.
+    backend.copy_d2d_async(scratch.x_resid, x_buf, HIDDEN as usize * 2, stream)?;
+    Ok(x_buf)
+}
+
 /// Per-layer KV cache for a single attention layer (single-batch).
 struct LayerKvCache {
     k: DevicePtr,
@@ -376,21 +602,29 @@ fn main() -> Result<()> {
     let final_norm = backend.alloc(t.data().len())?;
     backend.copy_h2d(t.data(), final_norm)?;
 
-    // Load all 8 full_attention layers.
-    println!("loading 8 full_attention layers...");
+    // Load all layers (8 full_attention + 24 linear_attention).
+    println!("loading all 32 layers...");
     let t0 = Instant::now();
     let mut full_layers: Vec<Option<FullAttentionLayer>> = (0..NUM_LAYERS).map(|_| None).collect();
+    let mut lin_layers: Vec<Option<LinearAttentionLayer>> = (0..NUM_LAYERS).map(|_| None).collect();
     for (idx, ty) in layer_types.iter().enumerate() {
         if ty == "full_attention" {
             full_layers[idx] = Some(FullAttentionLayer::load(&backend, &st, idx as u32)?);
-            println!("  layer {idx}: full_attention loaded");
+        } else if ty == "linear_attention" {
+            lin_layers[idx] = Some(LinearAttentionLayer::load(&backend, &st, idx as u32)?);
         }
     }
-    println!("  → full_attention weights loaded in {:.2?}", t0.elapsed());
+    println!("  → all weights loaded in {:.2?}", t0.elapsed());
 
-    // Allocate scratch + KV caches (one cache per full_attention layer; capacity = prompt_len + 1).
-    let max_seq_len = prompt_len + 1; // prompt + the one decode step we sample
+    // Allocate scratch + KV caches (one cache per full_attention layer).
+    // Capacity covers prompt + decode budget; bump via $ATLAS_DECODE_TOKENS.
+    let n_decode_budget: u32 = std::env::var("ATLAS_DECODE_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let max_seq_len = prompt_len + n_decode_budget + 4;
     let scratch = alloc_scratch(&backend)?;
+    let lin_scratch = alloc_lin_scratch(&backend)?;
     let kv_caches: Vec<LayerKvCache> = (0..full_attn_count)
         .map(|_| -> Result<LayerKvCache> {
             Ok(LayerKvCache {
@@ -405,8 +639,22 @@ fn main() -> Result<()> {
     {
         let mut next_slot = 0;
         for (idx, ty) in layer_types.iter().enumerate() {
-            if ty == "full_attention" {
+            if ty.as_str() == "full_attention" {
                 full_kv_slot[idx] = Some(next_slot);
+                next_slot += 1;
+            }
+        }
+    }
+    // Per-linear-attention-layer SSM/conv state.
+    let lin_states: Vec<LinearAttentionState> = (0..lin_attn_count)
+        .map(|_| LinearAttentionState::alloc(&backend))
+        .collect::<Result<_>>()?;
+    let mut lin_state_slot: Vec<Option<usize>> = (0..NUM_LAYERS).map(|_| None).collect();
+    {
+        let mut next_slot = 0;
+        for (idx, ty) in layer_types.iter().enumerate() {
+            if ty.as_str() == "linear_attention" {
+                lin_state_slot[idx] = Some(next_slot);
                 next_slot += 1;
             }
         }
@@ -440,6 +688,14 @@ fn main() -> Result<()> {
     let add = backend.kernel("bf16_add", "bf16_add")?;
     let silu = backend.kernel("silu_gate", "silu_gate")?;
     let embed = backend.kernel("embed_lookup", "embed_lookup")?;
+    let conv1d = backend.kernel("causal_conv1d_decode", "causal_conv1d_decode")?;
+    // The four GDN helpers all live in `gdn_helpers.metal` so the
+    // metallib module name is shared.
+    let gdn_gate = backend.kernel("gdn_helpers", "gdn_compute_gate")?;
+    let sigmoid = backend.kernel("gdn_helpers", "sigmoid_bf16_to_f32")?;
+    let silu_op = backend.kernel("gdn_helpers", "silu_apply")?;
+    let mul = backend.kernel("gdn_helpers", "bf16_mul")?;
+    let gdn_dec = backend.kernel("gated_delta_rule_decode", "gated_delta_rule_decode")?;
 
     // ── Embed-then-feed loop: process every prompt token through
     //    every layer, building KV cache. The hidden after the LAST
@@ -560,8 +816,17 @@ fn main() -> Result<()> {
                 backend.copy_d2d_async(out, x_buf, HIDDEN as usize * 2, stream)?;
                 x = x_buf;
             } else {
-                // linear_attention: identity passthrough (GDN orchestration TODO).
-                let _ = x;
+                // linear_attention: real GDN orchestration.
+                let layer = lin_layers[layer_idx]
+                    .as_ref()
+                    .expect("linear_attn layer not loaded");
+                let state = &lin_states[lin_state_slot[layer_idx].unwrap()];
+                let out = forward_linear_attention(
+                    &backend, layer, state, &lin_scratch,
+                    rms, conv1d, gdn_gate, sigmoid, silu_op, mul, gdn_dec, add,
+                    x, x_buf, stream,
+                )?;
+                x = out;
             }
         }
         backend.synchronize(stream)?;
@@ -569,44 +834,137 @@ fn main() -> Result<()> {
     let prefill_ms = t_total.elapsed().as_secs_f64() * 1000.0;
     println!("prefill complete in {prefill_ms:.1} ms ({:.1} ms/tok)", prefill_ms / prompt_len as f64);
 
-    // Final norm.
+    // Allocate sample-time buffers + kernels.
     let x_final = backend.alloc(HIDDEN as usize * 2)?;
-    backend.launch_typed(rms, [1, 1, 1], [128, 1, 1], 0, stream, &[
-        KernelArg::Bytes(&HIDDEN.to_le_bytes()),
-        KernelArg::Bytes(&RMS_EPS.to_le_bytes()),
-        KernelArg::Buffer(x_buf), KernelArg::Buffer(final_norm), KernelArg::Buffer(x_final),
-    ])?;
-
-    // LM head: tied to embed_tokens. logits[VOCAB] = embed_tokens @ x_final.
     let logits = backend.alloc(VOCAB as usize * 2)?;
-    embed_tokens.gemv(&backend, x_final, logits, stream)?;
-
-    // Argmax.
     let argmax = backend.kernel("argmax_bf16", "argmax_bf16")?;
-    let result = backend.alloc(4)?;
-    backend.launch_typed(argmax, [1, 1, 1], [128, 1, 1], 0, stream, &[
-        KernelArg::Bytes(&VOCAB.to_le_bytes()),
-        KernelArg::Buffer(logits), KernelArg::Buffer(result),
-    ])?;
-    backend.synchronize(stream)?;
-    let mut result_raw = [0u8; 4];
-    backend.copy_d2h(result, &mut result_raw)?;
-    let next_token_id = u32::from_le_bytes(result_raw);
+    let result_buf = backend.alloc(4)?;
 
+    // Helper: run final_norm + LM head + argmax → token id.
+    let sample_next = |x_in: DevicePtr| -> Result<u32> {
+        backend.launch_typed(rms, [1, 1, 1], [128, 1, 1], 0, stream, &[
+            KernelArg::Bytes(&HIDDEN.to_le_bytes()),
+            KernelArg::Bytes(&RMS_EPS.to_le_bytes()),
+            KernelArg::Buffer(x_in), KernelArg::Buffer(final_norm), KernelArg::Buffer(x_final),
+        ])?;
+        embed_tokens.gemv(&backend, x_final, logits, stream)?;
+        backend.launch_typed(argmax, [1, 1, 1], [128, 1, 1], 0, stream, &[
+            KernelArg::Bytes(&VOCAB.to_le_bytes()),
+            KernelArg::Buffer(logits), KernelArg::Buffer(result_buf),
+        ])?;
+        backend.synchronize(stream)?;
+        let mut buf = [0u8; 4];
+        backend.copy_d2h(result_buf, &mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    };
+
+    // First sample after prefill.
+    let next_token_id = sample_next(x_buf)?;
     let next_text = tokenizer
         .decode(&[next_token_id], false)
         .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
 
     println!();
-    println!("=== Generated next token ===");
+    println!("=== After prefill, first generated token ===");
     println!("  token_id: {next_token_id}");
     println!("  text:     {next_text:?}");
+
+    // Continue greedy decoding for N more tokens to see a full response.
+    let n_decode: usize = std::env::var("ATLAS_DECODE_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    println!();
+    println!("running greedy decode for {n_decode} more tokens...");
+    let t_dec = Instant::now();
+    let mut generated_ids = vec![next_token_id];
+    let mut current_token = next_token_id;
+    let mut cur_pos = prompt_len;
+    let embed_table = DevicePtr(EMBED_TABLE.load(std::sync::atomic::Ordering::SeqCst));
+
+    for _ in 0..n_decode {
+        // Reallocate KV caches if we're about to exceed capacity. For
+        // simplicity in this demo we don't grow — limit decode tokens
+        // to fit the pre-allocated max_seq_len.
+        if cur_pos >= max_seq_len {
+            println!("  (reached pre-allocated KV capacity {max_seq_len}, stopping)");
+            break;
+        }
+
+        // Embed current token.
+        let token_buf = backend.alloc(4)?;
+        backend.copy_h2d(&current_token.to_le_bytes(), token_buf)?;
+        let n_tokens = 1u32;
+        backend.launch_typed(embed, [HIDDEN.div_ceil(8), n_tokens, 1], [8, 1, 1], 0, stream, &[
+            KernelArg::Bytes(&n_tokens.to_le_bytes()),
+            KernelArg::Bytes(&HIDDEN.to_le_bytes()),
+            KernelArg::Bytes(&VOCAB.to_le_bytes()),
+            KernelArg::Buffer(token_buf), KernelArg::Buffer(embed_table), KernelArg::Buffer(x_buf),
+        ])?;
+        backend.free(token_buf)?;
+
+        // Position for RoPE.
+        backend.copy_h2d(&cur_pos.to_le_bytes(), positions_ptr)?;
+
+        // Layer chain.
+        let mut x = x_buf;
+        for (layer_idx, ty) in layer_types.iter().enumerate() {
+            if ty.as_str() == "full_attention" {
+                let layer = full_layers[layer_idx].as_ref().unwrap();
+                let kv = &kv_caches[full_kv_slot[layer_idx].unwrap()];
+                let cache_pos = cur_pos;
+                let seq_len_attn = cur_pos + 1;
+                let out = forward_full_attention(
+                    &backend, layer, &scratch, kv, rms, rope, kvap, attn, sg, add, silu,
+                    inv_freq_ptr, positions_ptr,
+                    x, cache_pos, seq_len_attn, stream,
+                )?;
+                backend.copy_d2d_async(out, x_buf, HIDDEN as usize * 2, stream)?;
+                x = x_buf;
+            } else {
+                let layer = lin_layers[layer_idx].as_ref().unwrap();
+                let state = &lin_states[lin_state_slot[layer_idx].unwrap()];
+                let out = forward_linear_attention(
+                    &backend, layer, state, &lin_scratch,
+                    rms, conv1d, gdn_gate, sigmoid, silu_op, mul, gdn_dec, add,
+                    x, x_buf, stream,
+                )?;
+                x = out;
+            }
+        }
+        backend.synchronize(stream)?;
+
+        // Sample.
+        current_token = sample_next(x_buf)?;
+        generated_ids.push(current_token);
+        cur_pos += 1;
+
+        // Bail on EOS to avoid runaway generation.
+        if current_token == 248044 {
+            // <|im_end|> per tokenizer_config.json
+            println!("  (hit <|im_end|>)");
+            break;
+        }
+    }
+    let dec_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
+
+    let full_text = tokenizer
+        .decode(&generated_ids, false)
+        .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    println!();
+    println!("=== Full generation ({} tokens, {dec_ms:.1} ms, {:.1} tok/s) ===",
+             generated_ids.len(), generated_ids.len() as f64 / (dec_ms / 1000.0));
+    println!("  ids: {generated_ids:?}");
+    println!("  text: {full_text:?}");
     println!();
     println!(
-        "Reminder: the linear_attention layers were identity passthrough \
-         in this run, so this answer reflects only the 8 full_attention \
-         layers' contribution. The token will not match what the real \
-         model would predict."
+        "All 32 layers fired (8 full_attention + 24 linear_attention via \
+         GDN). The GDN orchestration is best-effort — the kernel-level \
+         math (gated_delta_rule_decode) matches the CUDA reference \
+         exactly but the surrounding pre/post wiring (qkv split, gate \
+         clamping, residual placement) may diverge from the upstream \
+         Python reference in subtle ways. Token-level parity vs \
+         mlx_lm.generate is the next verification step."
     );
 
     Ok(())
