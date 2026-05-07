@@ -1237,6 +1237,115 @@ mod tests {
         backend.free(y_ptr).unwrap();
     }
 
+    /// `rope_apply` parity. GPT-NeoX-layout RoPE rotates pairs
+    /// `(d, d + head_dim/2)`. Independent FP32 reference verifies
+    /// both the cos/sin math and the index pairing.
+    #[test]
+    fn metal_rope_apply_matches_reference() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        let num_tokens: u32 = 4;
+        let num_heads: u32 = 2;
+        let head_dim: u32 = 16; // multiple of 2, half_dim = 8
+        let half_dim = head_dim / 2;
+
+        // x: deterministic per-element pattern.
+        let total = (num_tokens * num_heads * head_dim) as usize;
+        let x: Vec<half::bf16> = (0..total)
+            .map(|i| half::bf16::from_f32(0.1 + 0.001 * i as f32))
+            .collect();
+
+        // Standard rope_theta=10000.
+        let rope_theta: f32 = 10000.0;
+        let inv_freq: Vec<f32> = (0..half_dim)
+            .map(|i| 1.0 / rope_theta.powf(2.0 * i as f32 / head_dim as f32))
+            .collect();
+        let positions: Vec<u32> = (0..num_tokens).collect();
+
+        // CPU reference.
+        let mut expected = x.clone();
+        for tok in 0..num_tokens as usize {
+            let pos = positions[tok] as f32;
+            for h in 0..num_heads as usize {
+                let base = (tok * num_heads as usize + h) * head_dim as usize;
+                for d in 0..half_dim as usize {
+                    let theta = pos * inv_freq[d];
+                    let c = theta.cos();
+                    let s = theta.sin();
+                    let lo = x[base + d].to_f32();
+                    let hi = x[base + d + half_dim as usize].to_f32();
+                    expected[base + d] = half::bf16::from_f32(lo * c - hi * s);
+                    expected[base + d + half_dim as usize] =
+                        half::bf16::from_f32(lo * s + hi * c);
+                }
+            }
+        }
+
+        // Upload + launch.
+        let x_bytes = bf16_slice_to_bytes(&x);
+        let inv_freq_bytes: Vec<u8> = inv_freq
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let positions_bytes: Vec<u8> = positions
+            .iter()
+            .flat_map(|p| p.to_le_bytes())
+            .collect();
+
+        let x_ptr = backend.alloc(x_bytes.len()).unwrap();
+        let inv_freq_ptr = backend.alloc(inv_freq_bytes.len()).unwrap();
+        let positions_ptr = backend.alloc(positions_bytes.len()).unwrap();
+        backend.copy_h2d(&x_bytes, x_ptr).unwrap();
+        backend.copy_h2d(&inv_freq_bytes, inv_freq_ptr).unwrap();
+        backend.copy_h2d(&positions_bytes, positions_ptr).unwrap();
+
+        let kernel = backend.kernel("rope_apply", "rope_apply").unwrap();
+        backend
+            .launch_typed(
+                kernel,
+                [half_dim, num_heads, num_tokens],
+                [1, 1, 1],
+                0,
+                backend.default_stream(),
+                &[
+                    KernelArg::Bytes(&num_tokens.to_le_bytes()),
+                    KernelArg::Bytes(&num_heads.to_le_bytes()),
+                    KernelArg::Bytes(&head_dim.to_le_bytes()),
+                    KernelArg::Buffer(positions_ptr),
+                    KernelArg::Buffer(inv_freq_ptr),
+                    KernelArg::Buffer(x_ptr),
+                ],
+            )
+            .expect("launch rope_apply");
+        backend.synchronize(backend.default_stream()).unwrap();
+
+        let mut x_after = vec![0u8; x_bytes.len()];
+        backend.copy_d2h(x_ptr, &mut x_after).unwrap();
+        let actual = bytes_to_bf16_vec(&x_after);
+
+        let mut max_abs_diff: f32 = 0.0;
+        for i in 0..total {
+            let e = expected[i].to_f32();
+            let a = actual[i].to_f32();
+            let d = (e - a).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+            }
+            // Hard bail on the first wildly-wrong element to make
+            // failures localizable.
+            assert!(d < 0.05, "rope_apply mismatch at idx {i}: expected {e}, got {a}");
+        }
+        assert!(max_abs_diff < 0.02);
+
+        backend.free(x_ptr).unwrap();
+        backend.free(inv_freq_ptr).unwrap();
+        backend.free(positions_ptr).unwrap();
+        // mutate suppression — `x` was the input, kept until free for
+        // CPU-side reference computation.
+        let _ = x;
+    }
+
     /// `silu_gate` parity. Independent SwiGLU computation in FP32
     /// vs the kernel's FP32-internal pipeline. Tolerance allows for
     /// BF16 round-trip (input + output) but pins the activation
