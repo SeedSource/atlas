@@ -258,8 +258,16 @@ jobs:
       # runtime backend (objc2-metal). xcrun + metallib are part of
       # macOS's built-in Xcode Command Line Tools and don't need a
       # separate install on macos-14 runners.
-      - name: cargo check --workspace --features metal
-        run: cargo check --workspace --no-default-features --features atlas-core/metal,spark-runtime/metal,spark-storage/metal,spark-model/metal,spark-server/metal,atlas-spark-bench/metal
+      # `-p spark-server --features metal` activates the metal
+      # feature on every transitive workspace crate via spark-server's
+      # forwarding feature flags. Single-flag spelling — no long
+      # `atlas-core/metal,spark-runtime/metal,...` comma list needed.
+      - name: cargo check spark-server --features metal
+        run: cargo check -p spark-server --no-default-features --features metal
+      # Also check spark-runtime alone so a regression in the metal
+      # backend tests can be diagnosed independently of higher layers.
+      - name: cargo check spark-runtime --features metal
+        run: cargo check -p spark-runtime --no-default-features --features metal
       # Build the metal kernel set + run every metal_backend parity
       # test. The real-model parity tests (`#[ignore]`-gated) require
       # a local copy of mlx-community/Qwen3.5-4B-MLX-8bit and only
@@ -277,9 +285,13 @@ jobs:
       # `rustc-link-lib=cuda` directive snuck through a build.rs.
       - name: assert no libcuda linkage in metal binary
         run: |
-          cargo build --no-default-features --features atlas-core/metal,spark-runtime/metal,spark-storage/metal,spark-model/metal,spark-server/metal -p spark-server --bin spark
+          cargo build -p spark-server --bin spark --no-default-features --features metal
           if otool -L target/debug/spark | grep -i cuda; then
             echo "::error::metal-feature spark binary links libcuda"
+            exit 1
+          fi
+          if otool -L target/debug/spark | grep -i nccl; then
+            echo "::error::metal-feature spark binary links libnccl"
             exit 1
           fi
 
