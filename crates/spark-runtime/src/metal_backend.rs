@@ -2819,6 +2819,194 @@ mod tests {
         backend.free(out_ptr).unwrap();
     }
 
+    /// `gated_delta_rule_decode` parity. Mirrors the CUDA reference
+    /// kernel `gated_delta_rule.cu::gated_delta_rule_decode` — same
+    /// math, same arg layout. CPU reference walks the kernel's
+    /// algorithm step-for-step (hk_dot → v_new → state update +
+    /// q_dot → 1/sqrt(k_dim) scaling) so any drift surfaces only
+    /// as BF16 / FP32 round error.
+    ///
+    /// Skips the SSM state-norm clamp branch (the kernel includes
+    /// it but at our test magnitudes ||H||_F stays well below the
+    /// 1000 threshold, so the clamp doesn't fire).
+    #[test]
+    fn metal_gated_delta_rule_decode_matches_reference() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        // Qwen3.5-style dims (smaller for fast test).
+        let batch_size: u32 = 1;
+        let num_k_heads: u32 = 2;
+        let num_v_heads: u32 = 4;   // head_repeat = 2
+        let k_dim: u32 = 128;
+        let v_dim: u32 = 128;
+        let head_repeat = num_v_heads / num_k_heads;
+
+        // Initial H state, smaller magnitude so the norm clamp doesn't fire.
+        let h_state: Vec<f32> =
+            (0..(batch_size * num_v_heads * k_dim * v_dim) as usize)
+                .map(|i| 0.001 * ((i as f32) * 0.0123).sin())
+                .collect();
+
+        let query: Vec<half::bf16> = (0..(batch_size * num_k_heads * k_dim))
+            .map(|i| half::bf16::from_f32(0.05 + 0.001 * (i as f32 * 0.07).sin()))
+            .collect();
+        let key: Vec<half::bf16> = (0..(batch_size * num_k_heads * k_dim))
+            .map(|i| half::bf16::from_f32(0.04 + 0.001 * (i as f32 * 0.05).cos()))
+            .collect();
+        let value: Vec<half::bf16> = (0..(batch_size * num_v_heads * v_dim))
+            .map(|i| half::bf16::from_f32(0.06 + 0.001 * (i as f32 * 0.03).sin()))
+            .collect();
+        let gate: Vec<f32> = (0..(batch_size * num_v_heads))
+            .map(|i| 0.95 - 0.01 * i as f32)
+            .collect();
+        let beta: Vec<f32> = (0..(batch_size * num_v_heads))
+            .map(|i| 0.5 + 0.05 * i as f32)
+            .collect();
+
+        // ── CPU reference (matches kernel math step-for-step) ──
+        let mut h_cpu = h_state.clone();
+        let mut expected = vec![half::bf16::ZERO; (batch_size * num_v_heads * v_dim) as usize];
+        for b in 0..batch_size as usize {
+            for vh in 0..num_v_heads as usize {
+                let kh = vh / head_repeat as usize;
+                let g_raw = gate[b * num_v_heads as usize + vh];
+                let g = g_raw.clamp(1e-6, 1.0 - 1e-6);
+                let bt = beta[b * num_v_heads as usize + vh];
+                let h_off = (b * num_v_heads as usize + vh) * k_dim as usize * v_dim as usize;
+                let q_off = (b * num_k_heads as usize + kh) * k_dim as usize;
+                let k_off = (b * num_k_heads as usize + kh) * k_dim as usize;
+                let v_off = (b * num_v_heads as usize + vh) * v_dim as usize;
+
+                for tid in 0..v_dim as usize {
+                    let v_i = value[v_off + tid].to_f32();
+
+                    // Step 1: hk_dot
+                    let mut hk_dot = 0.0f32;
+                    for j in 0..k_dim as usize {
+                        let h_v = h_cpu[h_off + j * v_dim as usize + tid];
+                        let k_v = key[k_off + j].to_f32();
+                        hk_dot += h_v * k_v;
+                    }
+                    // Step 2: v_new
+                    let v_new_i = (v_i - g * hk_dot) * bt;
+                    // Steps 3+4: state update + output
+                    let mut q_dot = 0.0f32;
+                    for j in 0..k_dim as usize {
+                        let h_old = h_cpu[h_off + j * v_dim as usize + tid];
+                        let k_v = key[k_off + j].to_f32();
+                        let q_v = query[q_off + j].to_f32();
+                        let h_new = g * h_old + k_v * v_new_i;
+                        h_cpu[h_off + j * v_dim as usize + tid] = h_new;
+                        q_dot += h_new * q_v;
+                    }
+                    let inv_sqrt_d = (k_dim as f32).powf(-0.5);
+                    expected[(b * num_v_heads as usize + vh) * v_dim as usize + tid] =
+                        half::bf16::from_f32(q_dot * inv_sqrt_d);
+                }
+            }
+        }
+
+        // ── Run kernel ──
+        let h_state_bytes: Vec<u8> = h_state.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let q_bytes = bf16_slice_to_bytes(&query);
+        let k_bytes = bf16_slice_to_bytes(&key);
+        let v_bytes = bf16_slice_to_bytes(&value);
+        let g_bytes: Vec<u8> = gate.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let bt_bytes: Vec<u8> = beta.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        let h_ptr = backend.alloc(h_state_bytes.len()).unwrap();
+        let q_ptr = backend.alloc(q_bytes.len()).unwrap();
+        let k_ptr = backend.alloc(k_bytes.len()).unwrap();
+        let v_ptr = backend.alloc(v_bytes.len()).unwrap();
+        let g_ptr = backend.alloc(g_bytes.len()).unwrap();
+        let bt_ptr = backend.alloc(bt_bytes.len()).unwrap();
+        let out_ptr = backend.alloc((batch_size * num_v_heads * v_dim) as usize * 2).unwrap();
+
+        backend.copy_h2d(&h_state_bytes, h_ptr).unwrap();
+        backend.copy_h2d(&q_bytes, q_ptr).unwrap();
+        backend.copy_h2d(&k_bytes, k_ptr).unwrap();
+        backend.copy_h2d(&v_bytes, v_ptr).unwrap();
+        backend.copy_h2d(&g_bytes, g_ptr).unwrap();
+        backend.copy_h2d(&bt_bytes, bt_ptr).unwrap();
+
+        let kernel = backend
+            .kernel("gated_delta_rule_decode", "gated_delta_rule_decode")
+            .unwrap();
+        let total_groups = num_v_heads * batch_size;
+        backend
+            .launch_typed(
+                kernel,
+                [total_groups, 1, 1],
+                [128, 1, 1],
+                0,
+                backend.default_stream(),
+                &[
+                    KernelArg::Buffer(h_ptr),
+                    KernelArg::Buffer(q_ptr),
+                    KernelArg::Buffer(k_ptr),
+                    KernelArg::Buffer(v_ptr),
+                    KernelArg::Buffer(g_ptr),
+                    KernelArg::Buffer(bt_ptr),
+                    KernelArg::Buffer(out_ptr),
+                    KernelArg::Bytes(&batch_size.to_le_bytes()),
+                    KernelArg::Bytes(&num_k_heads.to_le_bytes()),
+                    KernelArg::Bytes(&num_v_heads.to_le_bytes()),
+                    KernelArg::Bytes(&k_dim.to_le_bytes()),
+                    KernelArg::Bytes(&v_dim.to_le_bytes()),
+                ],
+            )
+            .expect("launch gated_delta_rule_decode");
+        backend.synchronize(backend.default_stream()).unwrap();
+
+        let mut out_raw = vec![0u8; (batch_size * num_v_heads * v_dim) as usize * 2];
+        backend.copy_d2h(out_ptr, &mut out_raw).unwrap();
+        let actual = bytes_to_bf16_vec(&out_raw);
+
+        let mut max_abs_diff: f32 = 0.0;
+        for i in 0..expected.len() {
+            let e = expected[i].to_f32();
+            let a = actual[i].to_f32();
+            let d = (e - a).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+            }
+            assert!(a.is_finite(), "non-finite at idx {i}: {a}");
+        }
+        // Output magnitude ≈ 0.05; BF16 ULP at that scale ≈ 0.0004.
+        // Allow accumulation drift across 128-tap reduction.
+        assert!(
+            max_abs_diff < 0.02,
+            "gated_delta_rule_decode: max |expected - actual| = {max_abs_diff}"
+        );
+
+        // Also verify the in-place state was updated correctly (read it
+        // back and compare to h_cpu).
+        let mut h_after_raw = vec![0u8; h_state_bytes.len()];
+        backend.copy_d2h(h_ptr, &mut h_after_raw).unwrap();
+        let h_after: Vec<f32> = h_after_raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut h_max_diff: f32 = 0.0;
+        for i in 0..h_cpu.len() {
+            let d = (h_cpu[i] - h_after[i]).abs();
+            if d > h_max_diff {
+                h_max_diff = d;
+            }
+        }
+        assert!(
+            h_max_diff < 1e-3,
+            "h_state in-place update mismatch: max |h_cpu - h_actual| = {h_max_diff}"
+        );
+
+        // Suppress unused warning for h_state (used as starting bytes only).
+        let _ = h_state.len();
+        for ptr in [h_ptr, q_ptr, k_ptr, v_ptr, g_ptr, bt_ptr, out_ptr] {
+            backend.free(ptr).unwrap();
+        }
+    }
+
     /// `selective_scan_decode` parity. Drives 3 decode steps so the
     /// in-place state buffer is genuinely exercised, not coincidentally
     /// always reading the same values. CPU reference uses the exact

@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Type-safe kernel argument builder for CUDA kernel launches.
+//! Type-safe kernel argument builder for CUDA + Metal kernel launches.
 //!
 //! Replaces manual `Vec<*mut c_void>` construction with a builder
-//! pattern that prevents parameter type/order mismatches.
+//! pattern that prevents parameter type/order mismatches AND records
+//! per-arg type information so the metal backend can dispatch buffer
+//! args via `setBuffer:offset:atIndex:` and scalar args via
+//! `setBytes:length:atIndex:` (cuda's untyped `cuLaunchKernel` cannot
+//! distinguish the two; metal cannot conflate them).
 //!
 //! # Usage
 //!
@@ -17,29 +21,47 @@
 //!     .launch(stream)?;
 //! ```
 //!
-//! Values are stored as u64 for uniform alignment. On little-endian
-//! systems (all CUDA targets), the low bytes of each u64 contain the
-//! actual parameter data, which cuLaunchKernel reads correctly.
+//! Internally, every arg is recorded with its kind (Buffer / Scalar)
+//! and its native byte width. `launch()` materializes a typed
+//! `KernelArg` slice and calls `GpuBackend::launch_typed`. The
+//! cuda backend's default `launch_typed` impl flattens that back
+//! into the legacy `void**` shape; the metal backend overrides
+//! `launch_typed` to thread the type info through to the encoder.
 
 use anyhow::Result;
 
-use crate::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use crate::gpu::{DevicePtr, GpuBackend, KernelArg, KernelHandle};
 
-/// Builder for type-safe CUDA kernel launches.
+/// Per-arg metadata: which slot of `storage` it lives at, and how
+/// many native bytes it occupies. Buffer args set `is_buffer = true`
+/// and ignore `byte_len`. Scalar args set `is_buffer = false` and
+/// record `byte_len = sizeof::<T>()`.
+struct ArgKind {
+    is_buffer: bool,
+    /// Byte count for scalar args (4 for u32/i32/f32, 8 for u64).
+    /// Unused when `is_buffer` is true.
+    byte_len: u8,
+}
+
+/// Builder for type-safe kernel launches across CUDA + Metal.
 ///
 /// Accumulates grid dimensions, block dimensions, and typed kernel
-/// arguments. The `launch()` method constructs the raw `*mut c_void`
-/// parameter array and calls `GpuBackend::launch()`.
+/// arguments. `launch()` packages the args as `&[KernelArg]` and
+/// calls `GpuBackend::launch_typed`.
 pub struct KernelLaunch<'a> {
     gpu: &'a dyn GpuBackend,
     kernel: KernelHandle,
     grid: [u32; 3],
     block: [u32; 3],
     shared_mem: u32,
-    /// Backing storage: each parameter value stored as u64.
+    /// Backing storage: each parameter's bytes stored in a u64 slot
+    /// (LE-packed for scalars; raw u64 GPU address for pointers).
     /// Pointers into this vec remain stable because we never
     /// reallocate after the initial capacity reservation.
     storage: Vec<u64>,
+    /// Parallel array recording per-arg kind so `launch()` can build
+    /// a typed `KernelArg` slice.
+    kinds: Vec<ArgKind>,
 }
 
 impl<'a> KernelLaunch<'a> {
@@ -51,6 +73,7 @@ impl<'a> KernelLaunch<'a> {
             block: [1, 1, 1],
             shared_mem: 0,
             storage: Vec::with_capacity(16),
+            kinds: Vec::with_capacity(16),
         }
     }
 
@@ -72,18 +95,30 @@ impl<'a> KernelLaunch<'a> {
     /// Add a DevicePtr (u64) argument.
     pub fn arg_ptr(mut self, p: DevicePtr) -> Self {
         self.storage.push(p.0);
+        self.kinds.push(ArgKind {
+            is_buffer: true,
+            byte_len: 0,
+        });
         self
     }
 
     /// Add a u32 argument.
     pub fn arg_u32(mut self, v: u32) -> Self {
         self.storage.push(v as u64);
+        self.kinds.push(ArgKind {
+            is_buffer: false,
+            byte_len: 4,
+        });
         self
     }
 
     /// Add a u64 argument.
     pub fn arg_u64(mut self, v: u64) -> Self {
         self.storage.push(v);
+        self.kinds.push(ArgKind {
+            is_buffer: false,
+            byte_len: 8,
+        });
         self
     }
 
@@ -91,34 +126,60 @@ impl<'a> KernelLaunch<'a> {
     pub fn arg_i32(mut self, v: i32) -> Self {
         // Store as u64, preserving the i32 bits in the low 4 bytes.
         self.storage.push(v as u32 as u64);
+        self.kinds.push(ArgKind {
+            is_buffer: false,
+            byte_len: 4,
+        });
         self
     }
 
     /// Add an f32 argument.
     pub fn arg_f32(mut self, v: f32) -> Self {
         self.storage.push(f32::to_bits(v) as u64);
+        self.kinds.push(ArgKind {
+            is_buffer: false,
+            byte_len: 4,
+        });
         self
     }
 
-    /// Execute the kernel launch.
+    /// Execute the kernel launch via `GpuBackend::launch_typed`.
     ///
-    /// Builds the raw parameter pointer array from stored values,
-    /// then calls `GpuBackend::launch()`. The storage vec is not
-    /// reallocated between building pointers and launching, so
-    /// all pointers remain valid.
+    /// Builds a typed `KernelArg` slice from the recorded storage +
+    /// kinds. The cuda backend's default `launch_typed` flattens this
+    /// back into the legacy `void**` shape; the metal backend
+    /// overrides `launch_typed` to use `setBuffer:` / `setBytes:` per
+    /// arg. The storage vec is not reallocated between building the
+    /// args and launching, so all byte slices remain valid.
     pub fn launch(self, stream: u64) -> Result<()> {
-        let mut params: Vec<*mut std::ffi::c_void> = self
-            .storage
-            .iter()
-            .map(|v| v as *const u64 as *mut std::ffi::c_void)
-            .collect();
-        self.gpu.launch(
+        // Build typed args. The `&[u8]` slices borrow from `self.storage`
+        // (specifically the low N bytes of each u64 slot, LE-packed).
+        let mut args: Vec<KernelArg<'_>> = Vec::with_capacity(self.kinds.len());
+        for (idx, kind) in self.kinds.iter().enumerate() {
+            let slot = &self.storage[idx];
+            if kind.is_buffer {
+                args.push(KernelArg::Buffer(DevicePtr(*slot)));
+            } else {
+                // SAFETY: slot is a valid u64 in self.storage; we slice
+                // its first `byte_len` bytes (LE) and the slice's
+                // lifetime is bounded by the borrow of self.storage,
+                // which lives until the end of this function.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        slot as *const u64 as *const u8,
+                        kind.byte_len as usize,
+                    )
+                };
+                args.push(KernelArg::Bytes(bytes));
+            }
+        }
+        self.gpu.launch_typed(
             self.kernel,
             self.grid,
             self.block,
             self.shared_mem,
             stream,
-            &mut params,
+            &args,
         )
     }
 }
