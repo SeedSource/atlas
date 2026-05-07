@@ -2076,6 +2076,121 @@ mod tests {
         backend.free(result_ptr).unwrap();
     }
 
+    /// `causal_conv1d_decode` parity. Drives a few decode steps
+    /// against the CPU reference so the in-place state shift is
+    /// pinned (a read-after-write bug there would corrupt the next
+    /// step's output silently).
+    #[test]
+    fn metal_causal_conv1d_decode_matches_reference() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        let num_channels: u32 = 8;
+        let kernel_size: u32 = 4;
+        let state_len = (kernel_size - 1) as usize;
+
+        // Per-channel weight vectors and an initial conv_state.
+        let weights: Vec<half::bf16> = (0..(num_channels * kernel_size))
+            .map(|i| {
+                let c = i / kernel_size;
+                let k = i % kernel_size;
+                half::bf16::from_f32(0.1 * (c as f32 + 1.0) + 0.05 * k as f32)
+            })
+            .collect();
+        let mut conv_state_cpu: Vec<half::bf16> =
+            (0..(num_channels as usize * state_len))
+                .map(|i| half::bf16::from_f32(0.01 * i as f32))
+                .collect();
+
+        let weights_bytes = bf16_slice_to_bytes(&weights);
+        let weights_ptr = backend.alloc(weights_bytes.len()).unwrap();
+        let state_ptr = backend
+            .alloc(num_channels as usize * state_len * 2)
+            .unwrap();
+        let new_in_ptr = backend.alloc(num_channels as usize * 2).unwrap();
+        let out_ptr = backend.alloc(num_channels as usize * 2).unwrap();
+
+        backend.copy_h2d(&weights_bytes, weights_ptr).unwrap();
+        backend
+            .copy_h2d(&bf16_slice_to_bytes(&conv_state_cpu), state_ptr)
+            .unwrap();
+
+        let kernel = backend
+            .kernel("causal_conv1d_decode", "causal_conv1d_decode")
+            .unwrap();
+
+        // Drive 3 decode steps with deterministic-but-changing inputs
+        // so the state ring buffer is genuinely exercised, not
+        // accidentally always reading the same value.
+        for step in 0..3u32 {
+            let new_input: Vec<half::bf16> = (0..num_channels)
+                .map(|c| half::bf16::from_f32(0.5 + 0.1 * (step as f32 + c as f32)))
+                .collect();
+            backend
+                .copy_h2d(&bf16_slice_to_bytes(&new_input), new_in_ptr)
+                .unwrap();
+
+            // CPU reference: snapshot past, compute output, then
+            // shift state — exactly matches the kernel's algorithm.
+            let mut expected = vec![half::bf16::ZERO; num_channels as usize];
+            for c in 0..num_channels as usize {
+                let mut past = vec![0.0f32; kernel_size as usize];
+                for i in 0..state_len {
+                    past[i] = conv_state_cpu[c * state_len + i].to_f32();
+                }
+                past[state_len] = new_input[c].to_f32();
+                let mut acc = 0.0f32;
+                for i in 0..kernel_size as usize {
+                    let w = weights[c * kernel_size as usize + i].to_f32();
+                    acc += w * past[i];
+                }
+                expected[c] = half::bf16::from_f32(acc);
+                // Update the CPU-side state for the next iteration.
+                for i in 0..state_len {
+                    conv_state_cpu[c * state_len + i] =
+                        half::bf16::from_f32(past[i + 1]);
+                }
+            }
+
+            backend
+                .launch_typed(
+                    kernel,
+                    [num_channels.div_ceil(64), 1, 1],
+                    [64, 1, 1],
+                    0,
+                    backend.default_stream(),
+                    &[
+                        KernelArg::Bytes(&num_channels.to_le_bytes()),
+                        KernelArg::Bytes(&kernel_size.to_le_bytes()),
+                        KernelArg::Buffer(weights_ptr),
+                        KernelArg::Buffer(new_in_ptr),
+                        KernelArg::Buffer(state_ptr),
+                        KernelArg::Buffer(out_ptr),
+                    ],
+                )
+                .expect("launch causal_conv1d_decode");
+            backend.synchronize(backend.default_stream()).unwrap();
+
+            let mut out_raw = vec![0u8; num_channels as usize * 2];
+            backend.copy_d2h(out_ptr, &mut out_raw).unwrap();
+            let actual = bytes_to_bf16_vec(&out_raw);
+
+            for i in 0..num_channels as usize {
+                let e = expected[i].to_f32();
+                let a = actual[i].to_f32();
+                assert!(
+                    (e - a).abs() < 0.02,
+                    "step {step} ch {i}: expected {e}, got {a}"
+                );
+            }
+        }
+
+        backend.free(weights_ptr).unwrap();
+        backend.free(state_ptr).unwrap();
+        backend.free(new_in_ptr).unwrap();
+        backend.free(out_ptr).unwrap();
+    }
+
     /// Real-data parity check for `mlx_int8_gemv`. Loads the actual
     /// `language_model.model.layers.3.self_attn.q_proj` triplet (the
     /// first full_attention layer's Q projection), subsets to the
