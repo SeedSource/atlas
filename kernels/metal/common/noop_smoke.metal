@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Placeholder kernel for Phase 2/3: lets the build pipeline (xcrun metal
-// → metallib → include_bytes!) round-trip end-to-end before any real
-// kernel ports land. Phase 7 replaces this with rms_norm / gemv /
-// attention etc. The noop is referenced by the smoke test in
-// `crates/spark-runtime/src/metal_backend.rs` once the runtime backend
-// is implemented (Phase 4).
+// Minimal smoke kernel exercised by `metal_alloc_copy_launch_roundtrip`
+// in `crates/spark-runtime/src/metal_backend.rs`. Zeros the first `n`
+// floats of `out`. Kept around as a self-contained correctness probe
+// for the build + launch pipeline; production kernels live alongside.
 
 #include <metal_stdlib>
 using namespace metal;

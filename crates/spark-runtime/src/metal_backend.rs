@@ -757,6 +757,32 @@ fn sysctl_memsize() -> Option<usize> {
 mod tests {
     use super::*;
 
+    // ── Byte-conversion helpers (bytemuck-free) ──────────────────
+
+    fn u32_slice_to_bytes(values: &[u32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn bf16_slice_to_bytes(values: &[half::bf16]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(values.len() * 2);
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn bytes_to_bf16_vec(bytes: &[u8]) -> Vec<half::bf16> {
+        let mut out = Vec::with_capacity(bytes.len() / 2);
+        for chunk in bytes.chunks_exact(2) {
+            out.push(half::bf16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        out
+    }
+
     /// End-to-end check: alloc → memcpy → kernel launch → memcpy back.
     /// The kernel is `noop_smoke` from `kernels/metal/common/`. It
     /// writes 0.0 to the first `n` floats of `out`, so after launching
@@ -805,5 +831,144 @@ mod tests {
         assert_eq!(&after[16..], &pattern[16..], "kernel touched out-of-range bytes");
 
         backend.free(ptr).expect("free");
+    }
+
+    /// Parity check for `mlx_int8_dequant`. Builds a small known-good
+    /// (packed, scales, biases) triple, dequantizes via the kernel,
+    /// and compares against the CPU reference
+    /// `w[r,c] = byte * scales[r, c/group_size] + biases[r, c/group_size]`.
+    /// Exact-match BF16 isn't safe because the kernel accumulates in
+    /// FP32 then rounds; we tolerate L∞ ≤ 1/256 (BF16 ULP).
+    #[test]
+    fn metal_mlx_int8_dequant_matches_reference() {
+        let modules = atlas_kernels::metallib_modules();
+        let backend = MetalGpuBackend::new(0, &modules).expect("MetalGpuBackend::new");
+
+        // Small but representative shape — non-trivial vs the group
+        // boundary (group_size=64) and the 4-byte packing.
+        let out_features = 4u32;
+        let in_features = 128u32;
+        let group_size = 64u32;
+        let groups_per_row = (in_features / group_size) as usize;
+        let n_rows = out_features as usize;
+        let n_cols = in_features as usize;
+
+        // Deterministic byte pattern + per-(row, group) scale & bias.
+        let mut bytes_flat: Vec<u8> = Vec::with_capacity(n_rows * n_cols);
+        for r in 0..n_rows {
+            for c in 0..n_cols {
+                bytes_flat.push(((r * 7 + c) % 256) as u8);
+            }
+        }
+        let mut packed: Vec<u32> = Vec::with_capacity(n_rows * n_cols / 4);
+        for r in 0..n_rows {
+            for c in (0..n_cols).step_by(4) {
+                let base = r * n_cols + c;
+                let word = (bytes_flat[base] as u32)
+                    | ((bytes_flat[base + 1] as u32) << 8)
+                    | ((bytes_flat[base + 2] as u32) << 16)
+                    | ((bytes_flat[base + 3] as u32) << 24);
+                packed.push(word);
+            }
+        }
+
+        let mut scales: Vec<half::bf16> = Vec::with_capacity(n_rows * groups_per_row);
+        let mut biases: Vec<half::bf16> = Vec::with_capacity(n_rows * groups_per_row);
+        for r in 0..n_rows {
+            for g in 0..groups_per_row {
+                scales.push(half::bf16::from_f32(0.01 * (1.0 + r as f32) + 0.001 * g as f32));
+                biases.push(half::bf16::from_f32(-0.5 + 0.1 * r as f32 + 0.05 * g as f32));
+            }
+        }
+
+        // CPU reference — read scales/biases back as f32 (matches the
+        // FP32 accumulation in the kernel) before applying.
+        let mut expected: Vec<half::bf16> = vec![half::bf16::ZERO; n_rows * n_cols];
+        for r in 0..n_rows {
+            for c in 0..n_cols {
+                let byte = bytes_flat[r * n_cols + c] as f32;
+                let g = c / group_size as usize;
+                let s = scales[r * groups_per_row + g].to_f32();
+                let b = biases[r * groups_per_row + g].to_f32();
+                expected[r * n_cols + c] = half::bf16::from_f32(byte * s + b);
+            }
+        }
+
+        // Allocate, upload, launch, read back.
+        let packed_bytes_buf = u32_slice_to_bytes(&packed);
+        let scales_bytes_buf = bf16_slice_to_bytes(&scales);
+        let biases_bytes_buf = bf16_slice_to_bytes(&biases);
+
+        let packed_ptr = backend.alloc(packed_bytes_buf.len()).expect("alloc packed");
+        let scales_ptr = backend.alloc(scales_bytes_buf.len()).expect("alloc scales");
+        let biases_ptr = backend.alloc(biases_bytes_buf.len()).expect("alloc biases");
+        let out_ptr = backend.alloc(n_rows * n_cols * 2).expect("alloc out");
+
+        backend
+            .copy_h2d(&packed_bytes_buf, packed_ptr)
+            .expect("h2d packed");
+        backend
+            .copy_h2d(&scales_bytes_buf, scales_ptr)
+            .expect("h2d scales");
+        backend
+            .copy_h2d(&biases_bytes_buf, biases_ptr)
+            .expect("h2d biases");
+
+        let kernel = backend
+            .kernel("mlx_int8_dequant", "mlx_int8_dequant")
+            .expect("kernel lookup");
+
+        // 16×4 threads/threadgroup; one threadgroup per (col_tile, row).
+        let block_x = 16u32;
+        let block_y = 1u32;
+        let grid_x = in_features.div_ceil(block_x);
+        let grid_y = out_features;
+        backend
+            .launch_typed(
+                kernel,
+                [grid_x, grid_y, 1],
+                [block_x, block_y, 1],
+                0,
+                backend.default_stream(),
+                &[
+                    KernelArg::Bytes(&out_features.to_le_bytes()),
+                    KernelArg::Bytes(&in_features.to_le_bytes()),
+                    KernelArg::Bytes(&group_size.to_le_bytes()),
+                    KernelArg::Buffer(packed_ptr),
+                    KernelArg::Buffer(scales_ptr),
+                    KernelArg::Buffer(biases_ptr),
+                    KernelArg::Buffer(out_ptr),
+                ],
+            )
+            .expect("launch_typed dequant");
+        backend
+            .synchronize(backend.default_stream())
+            .expect("synchronize");
+
+        let mut out_raw = vec![0u8; n_rows * n_cols * 2];
+        backend.copy_d2h(out_ptr, &mut out_raw).expect("d2h out");
+        let actual = bytes_to_bf16_vec(&out_raw);
+
+        let mut max_abs_diff: f32 = 0.0;
+        for i in 0..expected.len() {
+            let e = expected[i].to_f32();
+            let a = actual[i].to_f32();
+            let d = (e - a).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+            }
+        }
+        // BF16 has 7-bit mantissa → ULP ≈ value * 2^-7. Worst case
+        // here is byte * scale_max + bias_max ≈ 255 * 0.04 + 0.0 ≈ 10.
+        // ULP at magnitude 10 ≈ 0.08 — give it 0.1 of headroom.
+        assert!(
+            max_abs_diff < 0.1,
+            "mlx_int8_dequant: max |expected - actual| = {max_abs_diff}, expected < 0.1"
+        );
+
+        backend.free(packed_ptr).unwrap();
+        backend.free(scales_ptr).unwrap();
+        backend.free(biases_ptr).unwrap();
+        backend.free(out_ptr).unwrap();
     }
 }
