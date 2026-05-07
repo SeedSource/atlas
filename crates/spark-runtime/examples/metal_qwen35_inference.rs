@@ -163,7 +163,10 @@ impl LinearAttentionLayer {
 
 /// Per-layer SSM/conv state for a linear-attention layer.
 struct LinearAttentionState {
-    /// BF16 [QKV_TOTAL_LIN, kernel_size - 1]. Persists across tokens.
+    /// FP32 [QKV_TOTAL_LIN, d_conv]. Persists across tokens. The
+    /// `causal_conv1d_update_l2norm` kernel matches the CUDA
+    /// reference and uses FP32 state — prevents recurrent precision
+    /// drift past 8K tokens that BF16 truncation introduces.
     conv1d_state: DevicePtr,
     /// FP32 [batch=1, num_v_heads, k_dim, v_dim]. Persists across tokens.
     gdn_state: DevicePtr,
@@ -171,6 +174,10 @@ struct LinearAttentionState {
 
 impl LinearAttentionState {
     fn alloc(backend: &MetalGpuBackend) -> Result<Self> {
+        // BF16 state sized for kernel_size - 1 — matches the simpler
+        // `causal_conv1d_decode` kernel that the example currently
+        // routes through. The fused FP32 + L2-norm variant requires
+        // wider state and isn't wired in yet.
         let conv_state_bytes = (QKV_TOTAL_LIN * (CONV_KERNEL_SIZE - 1)) as usize * 2;
         let gdn_state_floats = (NUM_V_HEADS_LIN * K_HEAD_DIM_LIN * V_HEAD_DIM_LIN) as usize;
         let conv_ptr = backend.alloc(conv_state_bytes)?;
@@ -253,7 +260,7 @@ fn forward_linear_attention(
     layer.in_proj_qkv.gemv(backend, scratch.x_norm, scratch.qkv, stream)?;
     layer.in_proj_z.gemv(backend, scratch.x_norm, scratch.z, stream)?;
 
-    // 3. causal conv1d on qkv (8192 channels, kernel_size 4)
+    // 3. plain causal conv1d (no fused SiLU/L2-norm yet).
     backend.launch_typed(conv1d, [QKV_TOTAL_LIN.div_ceil(64), 1, 1], [64, 1, 1], 0, stream, &[
         KernelArg::Bytes(&QKV_TOTAL_LIN.to_le_bytes()),
         KernelArg::Bytes(&CONV_KERNEL_SIZE.to_le_bytes()),
@@ -688,6 +695,9 @@ fn main() -> Result<()> {
     let add = backend.kernel("bf16_add", "bf16_add")?;
     let silu = backend.kernel("silu_gate", "silu_gate")?;
     let embed = backend.kernel("embed_lookup", "embed_lookup")?;
+    // Reverted to plain causal_conv1d_decode for now — the
+    // SiLU+L2-norm fused variant degrades output further. Revisit
+    // once we have a parity test for the fused kernel.
     let conv1d = backend.kernel("causal_conv1d_decode", "causal_conv1d_decode")?;
     // The four GDN helpers all live in `gdn_helpers.metal` so the
     // metallib module name is shared.
