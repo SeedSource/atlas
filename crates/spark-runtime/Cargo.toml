@@ -41,6 +41,16 @@ name = "metal_vision_block_forward"
 path = "examples/metal_vision_block_forward.rs"
 required-features = ["metal"]
 
+# Throughput benchmark for the metal backend: runs the layer-3
+# attention block N times and reports min / p50 / p99 / mean
+# latency + decode-equivalent tokens/sec. Useful for regression
+# tracking and for users to confirm their hardware matches the
+# expected envelope (~10 ms/forward on M2, scaling with bandwidth).
+[[example]]
+name = "metal_layer3_bench"
+path = "examples/metal_layer3_bench.rs"
+required-features = ["metal"]
+
 # Integration test gated by `test-utils` because it depends on the
 # `gpu::mock` module, which is itself `cfg(any(test, feature = "test-utils"))`.
 # Without this gate, default `cargo test --workspace` would attempt to compile
