@@ -58,7 +58,7 @@ required-features = ["metal"]
 # tied embed_tokens, sample greedily, decode the next token.
 [[example]]
 name = "metal_qwen35_inference"
-path = "examples/metal_qwen35_inference.rs"
+path = "examples/metal_qwen35_inference/main.rs"
 required-features = ["metal"]
 
 # Integration test gated by `test-utils` because it depends on the
