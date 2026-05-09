@@ -47,8 +47,14 @@ impl HighSpeedSwapConfig {
                 self.rank
             );
         }
-        if self.qd == 0 || self.qd > 64 {
-            bail!("--high-speed-swap-qd must be in 1..=64, got {}", self.qd);
+        if self.qd == 0 || self.qd > 256 {
+            // Cap raised from 64 → 256 (2026-05-09). With the per-`read()`
+            // `stream_sync` removed, the limiting factor on QD is the size
+            // of the pinned-bounce-buffer pool (qd × group_bytes). At
+            // group_bytes=4 KiB and the modern PM1743/9550-class drives'
+            // ≥1k-deep tolerance, even QD=256 is comfortable. Most users
+            // should leave the default of 32; raise only after profiling.
+            bail!("--high-speed-swap-qd must be in 1..=256, got {}", self.qd);
         }
         // The scratch pool must hold *at least one full tile*; tile_capacity
         // is taken to equal resident_blocks (single-tile fast path). Any

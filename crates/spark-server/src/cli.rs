@@ -342,9 +342,15 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 32)]
     pub high_speed_swap_rank: u32,
 
-    /// io_uring submission queue depth (Phase 3 shows QD=8 reaches
-    /// 3.4 GB/s on this DGX Spark image).
-    #[arg(long, default_value_t = 8)]
+    /// io_uring submission queue depth. Bumped from 8 → 32 (2026-05-09)
+    /// after the unnecessary per-`read()` `stream_sync` was removed:
+    /// with the sync gone, the previous QD=8 ceiling no longer applies
+    /// because each `read()` no longer flushes the SQ before returning.
+    /// Modern Gen5 NVMe (Samsung PM1743, Micron 9550, Solidigm D5)
+    /// saturates at QD≥32; the io_uring DBMS tuning paper (arxiv
+    /// 2512.04859) measured 2.05× throughput with deeper queues +
+    /// fixed buffers + SQPOLL on the same hardware class.
+    #[arg(long, default_value_t = 32)]
     pub high_speed_swap_qd: u32,
 
     /// Capture the per-layer body in a CUDA graph and replay (Phase 4).

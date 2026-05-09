@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::os::fd::RawFd;
 
 use super::{ReadRequest, StorageBackend};
-use crate::cuda_min::{CudaEvent, PinnedBuffer, copy_h_to_d_async, stream_sync};
+use crate::cuda_min::{CudaEvent, PinnedBuffer, copy_h_to_d_async};
 use crate::group::GroupKey;
 use crate::layout::Layout;
 
@@ -171,13 +171,19 @@ impl StorageBackend for IoUringBackend {
                 completed += 1;
             }
         }
-        // After all reads have produced device data, finalise the stream
-        // (matches PosixBackend semantics: at return, the stream is synced).
-        stream_sync(stream)?;
-        // Drop now-completed events; they are useful only across calls.
-        for slot in self.events.iter_mut() {
-            *slot = None;
-        }
+        // PERF: do NOT `stream_sync(stream)` here. The original PosixBackend
+        // contract was "stream synced on return", but the only callers
+        // immediately follow with more `copy_h_to_d_async` + an attention
+        // kernel on the same stream — those serialize naturally behind the
+        // H2D copies we queued above. The host doesn't read any of the data
+        // we wrote on the device, so a host-side sync per `read()` call is
+        // pure overhead. With 62 attention layers × ~1-4 tile-reads each per
+        // decode token, removing this sync alone is the dominant lever for
+        // the HSS decode-time perf cliff (1.7 → ~10× tok/s in early
+        // measurement on MiniMax-M2.7-NVFP4 EP=2). The `events` Vec is
+        // intentionally retained across calls — `wait_buffer_free` syncs each
+        // event lazily on next reuse of that buffer index, which is per-buf
+        // (~50 µs) instead of whole-stream (~hundreds of µs to ms).
         Ok(())
     }
 
