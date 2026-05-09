@@ -189,32 +189,43 @@ impl HighSpeedSwap {
         output_dev: u64,
         last_block_valid_slots: i32,
     ) -> Result<()> {
-        // 1. Project Q. 2. Score every block at this layer (only seq subset
-        //    is consumed; the rest is wasted compute but score_blocks is µs).
-        self.predictor
-            .project_q_on_stream(stream, q_dev, self.q_proj.ptr)?;
-        let m = &self.model;
-        let layer_a_g = self.predictor.a_g_dev_ptr()
-            + (layer as u64)
-                * (m.max_blocks_per_layer as u64)
-                * (m.num_kv_heads as u64)
-                * (m.block_size as u64)
-                * (self.cfg.rank as u64)
-                * 2;
-        self.predictor.score_blocks_on_stream(
-            stream,
-            self.q_proj.ptr,
-            layer_a_g,
-            self.block_scores_dev.ptr,
-            m.max_blocks_per_layer as usize,
-        )?;
-        copy_d_to_h_async(
-            self.score_host_buf.as_mut_ptr() as *mut c_void,
-            self.block_scores_dev.ptr,
-            self.score_host_buf.len() * 4,
-            stream,
-        )?;
-        stream_sync(stream)?;
+        // PERF: skip the Q projection + per-block scoring + D2H readback +
+        // stream-sync entirely when the sequence's blocks all fit in the
+        // resident scratch (no eviction can happen this call). The scores
+        // are only consumed by `record_score` on missing-block assign,
+        // which informs the next-call eviction policy — when no eviction
+        // is needed, the sync is pure overhead. At 62 attention layers
+        // this drops 62 host-side stream syncs/token (each ~100-300 µs on
+        // the GB10 EP=2 stream), which dominated the HSS decode path.
+        let need_eviction = seq_block_ids.len() > self.cfg.resident_blocks as usize;
+        if need_eviction {
+            // 1. Project Q. 2. Score every block at this layer (only seq subset
+            //    is consumed; the rest is wasted compute but score_blocks is µs).
+            self.predictor
+                .project_q_on_stream(stream, q_dev, self.q_proj.ptr)?;
+            let m = &self.model;
+            let layer_a_g = self.predictor.a_g_dev_ptr()
+                + (layer as u64)
+                    * (m.max_blocks_per_layer as u64)
+                    * (m.num_kv_heads as u64)
+                    * (m.block_size as u64)
+                    * (self.cfg.rank as u64)
+                    * 2;
+            self.predictor.score_blocks_on_stream(
+                stream,
+                self.q_proj.ptr,
+                layer_a_g,
+                self.block_scores_dev.ptr,
+                m.max_blocks_per_layer as usize,
+            )?;
+            copy_d_to_h_async(
+                self.score_host_buf.as_mut_ptr() as *mut c_void,
+                self.block_scores_dev.ptr,
+                self.score_host_buf.len() * 4,
+                stream,
+            )?;
+            stream_sync(stream)?;
+        }
 
         // 3. Tile loop.
         self.attn.begin_step_on_stream(stream, 1)?;
@@ -247,8 +258,14 @@ impl HighSpeedSwap {
                 let slot = self.pool.assign(key, &candidates)?;
                 pinned.push(slot);
                 self.eviction.touch(slot);
-                self.eviction
-                    .record_score(slot, self.score_host_buf[blk as usize]);
+                if need_eviction {
+                    // Score buf is only refreshed when eviction matters
+                    // (see fast-path skip above). When we skipped scoring,
+                    // fall back to LRU-only ranking — `eviction.touch` is
+                    // sufficient and `record_score` would feed stale data.
+                    self.eviction
+                        .record_score(slot, self.score_host_buf[blk as usize]);
+                }
                 // Find this block's index in the tile so the block_table is right.
                 let idx = tile.iter().position(|&x| x == blk).unwrap();
                 block_table[idx] = slot as i32;
