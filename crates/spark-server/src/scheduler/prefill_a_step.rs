@@ -59,13 +59,15 @@ pub fn start_chunked_prefill(
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
     let grammar_state = compile_grammar_state(grammar_engine, &grammar_spec);
-    let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature) = match req {
+    let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req
+    {
         InferenceRequest::Streaming {
             prompt_tokens,
             max_tokens,
             temperature,
             token_tx,
             image_pixels,
+            cancel_flag,
             ..
         } => (
             prompt_tokens,
@@ -73,6 +75,7 @@ pub fn start_chunked_prefill(
             ResponseSink::Streaming(token_tx),
             image_pixels,
             temperature,
+            Some(cancel_flag),
         ),
         InferenceRequest::Blocking {
             prompt_tokens,
@@ -87,6 +90,7 @@ pub fn start_chunked_prefill(
             ResponseSink::Blocking(Some(response_tx)),
             image_pixels,
             temperature,
+            None,
         ),
     };
 
@@ -220,6 +224,7 @@ pub fn start_chunked_prefill(
                 eos_tokens: eos_tokens.to_vec(),
                 finished: true,
                 sink,
+                cancel_flag: cancel_flag.clone(),
                 temperature,
                 top_k,
                 top_p,
@@ -290,6 +295,7 @@ pub fn start_chunked_prefill(
                 eos_tokens: eos_tokens.to_vec(),
                 finished: false,
                 sink,
+                cancel_flag,
                 temperature,
                 top_k,
                 top_p,
@@ -363,6 +369,7 @@ pub fn start_chunked_prefill(
             min_tokens: req_min_tokens,
             eos_tokens: eos_tokens.to_vec(),
             sink,
+            cancel_flag,
             request_start,
             temperature,
             top_k,

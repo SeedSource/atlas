@@ -248,6 +248,10 @@ pub fn resume_swapped_seq(
         eos_tokens: s.eos_tokens,
         finished: false,
         sink: s.sink,
+        // cancel_flag isn't preserved across spill/restore — the
+        // original stream is long gone by the time a swapped-out seq
+        // resumes from disk, so the live guards don't apply here.
+        cancel_flag: None,
         temperature: s.temperature,
         top_k: s.top_k,
         top_p: s.top_p,
