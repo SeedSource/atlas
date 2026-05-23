@@ -101,6 +101,18 @@ pub(super) struct StreamState {
     /// this, `stop_string_triggered` only suppresses output and the
     /// scheduler keeps generating until natural EOS / max_tokens.
     pub(super) cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Rolling tail (≤256 chars) of decoded reasoning text, used by the
+    /// in-think tool-call leak scanner. Accumulated cross-delta so a
+    /// boundary-split opener (e.g. `<too` in one delta + `l_call>` in
+    /// the next) is still visible when the buffer is scanned. Only
+    /// populated during the thinking phase.
+    pub(super) reasoning_xml_scan_buf: String,
+    /// One-shot flag: true once the scanner has detected a literal
+    /// `<tool_call>` / `<function=` / `<parameter=` / `<invoke ` opener
+    /// inside the reasoning stream. After it flips, subsequent
+    /// thinking-phase tokens short-circuit with empty SSE output until
+    /// the scheduler picks up the cancel_flag and finalises.
+    pub(super) reasoning_xml_leak_detected: bool,
     /// Streaming tool-call detector (`Some` iff `tools_active`).
     pub(super) detector: Option<tool_parser::StreamingToolDetector>,
     /// True iff the reasoning/`<think>` phase has finished. Starts
@@ -139,6 +151,8 @@ impl StreamState {
             name_run: None,
             tool_loop_capped: false,
             cancel_flag,
+            reasoning_xml_scan_buf: String::new(),
+            reasoning_xml_leak_detected: false,
             detector: if tools_active {
                 Some(tool_parser::StreamingToolDetector::new())
             } else {

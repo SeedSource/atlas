@@ -71,6 +71,16 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
         }
         // Still in thinking — accumulate but don't emit as content
         if ctx.enable_thinking {
+            // Layer-A one-shot guard: after the in-think tool-call leak
+            // scanner has fired, suppress all subsequent reasoning
+            // deltas for this stream. The scheduler's `cancel_flag`
+            // (set when the scanner fired) finalises the sequence
+            // within one token via `emit_step::emit_token`; this
+            // guard catches the in-flight token race so the next
+            // opener never reaches the client.
+            if state.reasoning_xml_leak_detected {
+                return sse_events;
+            }
             // Open thinking: emit as reasoning_content
             let full = ctx
                 .state
@@ -124,6 +134,60 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
                     let nl_form = format!("\n{word}\n");
                     while cleaned.contains(&nl_form) {
                         cleaned = cleaned.replace(&nl_form, "\n");
+                    }
+                }
+                // Layer-A in-think tool-call leak scanner. The per-
+                // delta strippers above can miss boundary splits
+                // (e.g. `<too` in delta N + `l_call>` in delta N+1)
+                // and even when they strip, the model keeps emitting
+                // the next repetition because its own KV already
+                // contains the literal opener. This sliding-window
+                // detector across deltas catches the opener on
+                // arrival, drops the delta, sets the loop-cap flag
+                // (→ finish_reason="length" via the PR #87 override)
+                // and flips the scheduler cancel_flag so generation
+                // terminates within one token via PR #89.
+                let tools_active_request =
+                    !ctx.tool_defs_for_backfill.is_empty() || state.detector.is_some();
+                if tools_active_request {
+                    state.reasoning_xml_scan_buf.push_str(&cleaned);
+                    if state.reasoning_xml_scan_buf.len() > 256 {
+                        let drop_to = state.reasoning_xml_scan_buf.len() - 256;
+                        let cut = state
+                            .reasoning_xml_scan_buf
+                            .char_indices()
+                            .find(|&(i, _)| i >= drop_to)
+                            .map(|(i, _)| i)
+                            .unwrap_or(state.reasoning_xml_scan_buf.len());
+                        state.reasoning_xml_scan_buf.drain(..cut);
+                    }
+                    let opener = ["<tool_call>", "<function=", "<parameter=", "<invoke "]
+                        .iter()
+                        .copied()
+                        .find(|m| state.reasoning_xml_scan_buf.contains(m));
+                    if let Some(op) = opener {
+                        state.reasoning_xml_leak_detected = true;
+                        state.tool_loop_capped = true;
+                        state.stop_string_triggered = true;
+                        state
+                            .cancel_flag
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        let tail_start = state
+                            .reasoning_xml_scan_buf
+                            .char_indices()
+                            .rev()
+                            .nth(63)
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        let tail = &state.reasoning_xml_scan_buf[tail_start..];
+                        tracing::warn!(
+                            model = %ctx.model,
+                            request_id = %ctx.id,
+                            opener = op,
+                            tail = %tail,
+                            "in-think tool-call leak detected; cancelling sequence (finish_reason will be \"length\")"
+                        );
+                        return sse_events;
                     }
                 }
                 // F19: final structured sanitisation pass catches

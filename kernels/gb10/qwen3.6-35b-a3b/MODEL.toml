@@ -96,14 +96,17 @@ enable_loop_watchdog = false
 # via chat_template_kwargs.enable_thinking still wins; CLI --disable-thinking
 # is the kill-switch.
 thinking_default = true
-# Thinking ENABLED during tool-active turns (2026-05-20): Qwen3.6 reasoning
-# is materially better than Qwen3.5 and the prior "Think-Satisfy" failure
-# mode (model reasoning about tool calls in <think>, convincing itself the
-# task is done, then narrating instead of calling tools) hasn't reproduced
-# on this model variant. max_thinking_budget=512 caps any drift, and
-# opencode users need visible CoT on agentic turns. Flip back to false if
-# tool-call rate regresses.
-thinking_in_tools = true
+# Thinking DISABLED during tool-active turns (2026-05-23): a new failure
+# mode emerged with opencode (9 tool schemas, temp=0.3, large system
+# prompt) — the model emits literal `<tool_call><function=…>…</tool_call>`
+# XML INSIDE its `<think>` block, repeated 6+ times before the thinking
+# budget force-closes `</think>`. The leak reaches opencode's rendered
+# transcript as reasoning_content deltas and visibly contaminates the
+# session. Three-agent investigation pinpointed six root causes; this
+# is the immediate hotfix (Layer D). The stream-side scanner in
+# chat_stream/handle_token.rs (Layer A) closes the underlying gap; once
+# that lands and is validated end-to-end, flip this back to true.
+thinking_in_tools = false
 # Maximum thinking budget (tokens). Prevents overthinking.
 # Client-specified budget takes precedence if lower.
 max_thinking_budget = 512
