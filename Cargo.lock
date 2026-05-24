@@ -32,7 +32,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< dependabot/cargo/criterion-0.8.2
 name = "alloca"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -40,12 +39,12 @@ checksum = "e5a7d05ea6aea7e9e64d25b9156ba2fee3fdd659e34e41063cd2fc7cd020d7f4"
 dependencies = [
  "cc",
 ]
-=======
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
->>>>>>> main
 
 [[package]]
 name = "anes"
