@@ -103,6 +103,13 @@ impl TransformerModel {
         num_tokens: usize,
         stream: u64,
     ) -> Result<()> {
+        // Symmetric with scale_embeddings_bf16: models without embedding
+        // scaling (non-Gemma, e.g. qwen3.6-27b) have no embed_scale kernel
+        // registered (handle == 0). Without this guard the FP8 fp32-residual
+        // path hard-fails ("Module 'embed_scale' not loaded").
+        if self.embed_scale_kernel.0 == 0 {
+            return Ok(());
+        }
         use spark_runtime::kernel_args::KernelLaunch;
         let kernel = self.gpu.kernel("embed_scale", "f32_scale_inplace")?;
         let n = (num_tokens * self.config.hidden_size) as u32;
@@ -266,8 +273,8 @@ impl TransformerModel {
         Ok(logits)
     }
 
-    /// Apply logit softcapping in-place: logits[i] = cap * tanh(logits[i] / cap).
-    /// BF16 path. Use [`apply_logit_softcap_dtype`] to dispatch by buffer dtype.
+    /// Apply logit softcapping in-place: `logits[i] = cap * tanh(logits[i] / cap)`.
+    /// BF16 path. Use `apply_logit_softcap_dtype` to dispatch by buffer dtype.
     pub(super) fn apply_logit_softcap(
         &self,
         logits: DevicePtr,

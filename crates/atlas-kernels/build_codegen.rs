@@ -32,10 +32,13 @@ pub(super) fn generate_target_ptx_rs(
     //            `pub fn ptx_modules() -> Vec<(&str, &str)>`
     //   binary → `pub const FOO_METALLIB: &[u8] = include_bytes!(...)`,
     //            `pub fn metallib_modules() -> Vec<(&str, &[u8])>`
-    let (const_suffix, ty, include_macro, fn_root, modules_ty) = if output_is_text {
+    // `const_ty` drops the `'static` (consts default to `'static` —
+    // clippy::redundant_static_lifetimes); `modules_ty` keeps it (no
+    // elision possible for function return signature).
+    let (const_suffix, const_ty, include_macro, fn_root, modules_ty) = if output_is_text {
         (
             "PTX",
-            "&'static str",
+            "&str",
             "include_str!",
             "ptx_modules",
             "Vec<(&'static str, &'static str)>",
@@ -43,7 +46,7 @@ pub(super) fn generate_target_ptx_rs(
     } else {
         (
             "METALLIB",
-            "&'static [u8]",
+            "&[u8]",
             "include_bytes!",
             "metallib_modules",
             "Vec<(&'static str, &'static [u8])>",
@@ -63,7 +66,7 @@ pub(super) fn generate_target_ptx_rs(
         for (stem, module_name) in modules {
             let const_name = format!("{}{}_{}", prefix, module_name.to_uppercase(), const_suffix);
             g.push_str(&format!(
-                "pub const {const_name}: {ty} = \
+                "pub const {const_name}: {const_ty} = \
                  {include_macro}(concat!(env!(\"ATLAS_PTX_DIR\"), \"/t{idx}__{stem}.{output_ext}\"));\n"
             ));
         }
@@ -165,6 +168,16 @@ pub(super) fn generate_target_ptx_rs(
              \x20               disable_tool_steering: {},\n\
              \x20               tool_call_parser: \"{}\",\n\
              \x20               enable_loop_watchdog: {},\n\
+             \x20               think_loop_min_repeats: {},\n\
+             \x20               think_loop_scan_window: {},\n\
+             \x20               confidence_early_stop: {},\n\
+             \x20               confidence_run_length: {},\n\
+             \x20               fuzzy_repeat_tolerance_div: {},\n\
+             \x20               max_inter_tool_prose: {},\n\
+             \x20               tscg: {},\n\
+             \x20               disable_tool_grammar: {},\n\
+             \x20               rollback_resteer: {},\n\
+             \x20               rom_head: \"{}\",\n\
              \x20           }},\n\
              \x20           model_type_matches: vec![{}],\n\
              \x20           dflash: {},\n\
@@ -183,6 +196,16 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_disable_tool_steering,
             target.behavior_tool_call_parser,
             target.behavior_enable_loop_watchdog,
+            target.behavior_think_loop_min_repeats,
+            target.behavior_think_loop_scan_window,
+            target.behavior_confidence_early_stop,
+            target.behavior_confidence_run_length,
+            target.behavior_fuzzy_repeat_tolerance_div,
+            target.behavior_max_inter_tool_prose,
+            target.behavior_tscg,
+            target.behavior_disable_tool_grammar,
+            target.behavior_rollback_resteer,
+            target.behavior_rom_head,
             target.model_type_matches.iter().map(|m| {
                 let hs = match m.hidden_size {
                     Some(v) => format!("Some({v})"),
