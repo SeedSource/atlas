@@ -26,17 +26,29 @@
 //! **verify-time** argmax is replaced.
 //!
 //! Per-position semantics: the pipeline is applied independently to
-//! each verify position 0..K using the live `ActiveSeq` state at call
-//! time. For position 0 that state is exactly the post-`last_token`
-//! state, identical to the non-MTP decode site. For positions ≥ 1 the
-//! sequence state has not yet been advanced by `emit_token(drafts[i])`
-//! (acceptance is decided after this call), so a few state-dependent
-//! masks (mid-word lookback, etc.) read a slightly stale `last
-//! output_tokens` — best-effort, identical to what the model itself
-//! does internally when unrolling the verify positions greedily. The
-//! grammar / forced-think masks still apply correctly because they
-//! key off flags that only flip via `emit_token`, which has not yet
-//! run on the verify position.
+//! each verify position 0..K. For position 0 the `ActiveSeq` state is
+//! exactly the post-`last_token` state, identical to the non-MTP
+//! decode site. For positions ≥ 1, the driver SPECULATIVELY ADVANCES
+//! the xgrammar matcher via `gs.accept_token(pick_{i-1})` between
+//! positions, so each position's bitmask reflects the matcher state
+//! that will actually exist at `emit_token` time on the accept path.
+//! Speculative advances are rolled back via `gs.rollback(n)` once all
+//! K positions have been picked; the real `emit_token` calls then
+//! re-advance the matcher normally for the verified tokens that
+//! actually get emitted.
+//!
+//! **DO NOT remove the speculative advance.** Prior versions emitted
+//! position-1 argmax against position-0 bitmask, which desynced
+//! xgrammar on the accept path and tripped the non-silent
+//! `accept_token` kill switch (observed live on
+//! opencode-realfix.jsonl 2026-05-24: every response ended with
+//! `length` + `tok=198 output_len=30-60` because the bonus token was
+//! masked at position 0's state — a `\n` legal at JSON-value-start
+//! is not legal at JSON-comma-or-closebrace).
+//!
+//! Other state-dependent masks (mid-word lookback, last_token reads)
+//! still see slightly stale `output_tokens` for positions ≥ 1 —
+//! best-effort, mirrors greedy unroll.
 
 use crate::scheduler::ActiveSeq;
 use crate::scheduler::helpers::bf16_to_f32;
@@ -139,10 +151,56 @@ pub fn verify_pick_all_with_pipeline(
     {
         return argmax_ids.to_vec();
     }
-    (0..k)
-        .map(|i| {
-            let slice = &buf[i * vocab * elem_bytes..(i + 1) * vocab * elem_bytes];
-            verify_pick_with_pipeline(slice, false, vocab, a, ctx)
-        })
-        .collect()
+
+    let mut picks: Vec<u32> = Vec::with_capacity(k);
+    // Speculative-advance counter — we rollback this many tokens off
+    // the xgrammar matcher at the end so the real `emit_token` calls
+    // (which run after this helper returns) re-advance with the
+    // verified-or-rejected tokens from a clean state.
+    let mut grammar_advances: usize = 0;
+
+    for i in 0..k {
+        let slice = &buf[i * vocab * elem_bytes..(i + 1) * vocab * elem_bytes];
+        let pick = verify_pick_with_pipeline(slice, false, vocab, a, ctx);
+        picks.push(pick);
+
+        // Speculatively advance the matcher with `pick[i]` so the next
+        // position's bitmask reflects post-emit state. Skip on the last
+        // position (no next position to mask) and when the seq has no
+        // grammar (nothing to advance).
+        if i + 1 < k
+            && let Some(ref mut gs) = a.grammar_state
+            && !a.inside_thinking
+        {
+            // Matcher advance can fail if `pick` is not in the current
+            // bitmask. If our pipeline correctly applied the bitmask,
+            // pick is the argmax over masked logits → MUST be in the
+            // bitmask → advance MUST succeed. The defensive check
+            // exists for forced-token fast-path returns where the
+            // grammar may have terminated; those legitimately can't
+            // advance further.
+            if !gs.accept_token(pick) {
+                tracing::debug!(
+                    pick,
+                    i,
+                    "verify_pick: grammar speculative advance refused — pipeline picked a token outside the current bitmask. \
+                     This indicates a stale bitmask in the pipeline or a forced-token fastpath that terminated grammar. \
+                     Stopping speculation here; the real `accept_token` in emit_token will fail and end the response."
+                );
+                break;
+            }
+            grammar_advances += 1;
+        }
+    }
+
+    // Roll back all speculative advances so the matcher returns to its
+    // pre-call state. `emit_token` will then re-advance it normally for
+    // the tokens that actually get accepted by the scheduler.
+    if grammar_advances > 0
+        && let Some(ref mut gs) = a.grammar_state
+    {
+        gs.rollback(grammar_advances);
+    }
+
+    picks
 }
