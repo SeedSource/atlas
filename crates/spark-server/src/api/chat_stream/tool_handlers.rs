@@ -33,7 +33,8 @@ pub(super) fn handle_complete_tool_call(
         &ctx.leak_markers,
     );
     if !pre_tool_tail.is_empty() {
-        let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, pre_tool_tail);
+        let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, pre_tool_tail)
+            .with_token_ids(state.take_ids_if(ctx.req_return_token_ids));
         sse_events.push(Ok(
             Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
         ));
@@ -48,7 +49,8 @@ pub(super) fn handle_complete_tool_call(
             "tool call validation error: {e}; replacing with content and ending"
         );
         let msg = format!("[atlas] Tool call rejected: {e}");
-        let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, msg);
+        let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, msg)
+            .with_token_ids(state.take_ids_if(ctx.req_return_token_ids));
         sse_events.push(Ok(
             Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
         ));
@@ -62,6 +64,7 @@ pub(super) fn handle_complete_tool_call(
             "tool-arg dedup tripped: refusing redundant tool_call and ending response"
         );
         state.stop_string_triggered = true;
+        state.tool_loop_capped = true;
     } else {
         // Bug-2 name-run cap (mirrors handle_tool_call_end): catches
         // runaway loops in the complete-tool-call path that
@@ -79,6 +82,7 @@ pub(super) fn handle_complete_tool_call(
                 tc.function.name
             );
             state.stop_string_triggered = true;
+            state.tool_loop_capped = true;
         }
         bump_f12_tool_call_count(
             &mut state.tool_calls_emitted_count,
@@ -126,7 +130,8 @@ pub(super) fn handle_tool_call_start(
         &ctx.leak_markers,
     );
     if !pre_tool_tail.is_empty() {
-        let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, pre_tool_tail);
+        let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, pre_tool_tail)
+            .with_token_ids(state.take_ids_if(ctx.req_return_token_ids));
         sse_events.push(Ok(
             Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
         ));
@@ -202,6 +207,11 @@ pub(super) fn handle_tool_call_delta(
                 "tool call validation error (stream Δ): {e}; replacing with content and ending"
             );
             let msg = format!("[atlas] Tool call rejected: {e}");
+            // No `with_token_ids` here: `entry` holds a &mut borrow of
+            // `state` through line 214, so `take_ids_if` can't run. This
+            // is a rare synthetic-error edge (not the generation path);
+            // the pending IDs are still flushed exactly once on the
+            // finish chunk in handle_done, so Σ token_ids stays correct.
             let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, msg);
             sse_events.push(Ok(
                 Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
@@ -245,6 +255,7 @@ pub(super) fn handle_tool_call_end(state: &mut StreamState, ctx: &StreamCtx, idx
                 "F11 within-response dedup tripped: 2+ identical streaming tool calls; ending response"
             );
             state.stop_string_triggered = true;
+            state.tool_loop_capped = true;
         } else if ctx.f44_cache_active
             && f44_check_permanent_failure(&ctx.f44_cache, &name, &args_json)
         {
@@ -253,6 +264,7 @@ pub(super) fn handle_tool_call_end(state: &mut StreamState, ctx: &StreamCtx, idx
                 "F44 streaming circuit-breaker tripped: tool_call matches a permanently-failed prior call; ending response"
             );
             state.stop_string_triggered = true;
+            state.tool_loop_capped = true;
         }
         let run_len = match &state.name_run {
             Some((prev, n)) if prev == &name => n + 1,
@@ -266,6 +278,7 @@ pub(super) fn handle_tool_call_end(state: &mut StreamState, ctx: &StreamCtx, idx
                 "Bug-2 name-run cap tripped: {run_len} successive `{name}` tool calls; ending response (F11 missed because args drift)"
             );
             state.stop_string_triggered = true;
+            state.tool_loop_capped = true;
         }
         if !state.stop_string_triggered {
             // Successful streaming tool call — log + metric to match the

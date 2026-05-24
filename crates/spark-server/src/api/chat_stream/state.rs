@@ -82,11 +82,31 @@ pub(super) struct StreamState {
     /// `(last_name, run_length)`. `last_name = None` means the run
     /// was just broken by a different tool name.
     pub(super) name_run: Option<(String, u32)>,
+    /// Set true when ANY tool-call loop guard forcibly ends the
+    /// response: the Bug-2 name-run cap, F11 within-response dedup,
+    /// F5 cross-flush dedup, or F44 permanent-failure circuit-breaker.
+    /// `handle_done` reads this and overrides `finish_reason` to
+    /// `"length"` — without the override the response otherwise looks
+    /// like a normal `"tool_calls"` completion (because tool calls
+    /// were emitted), and agent clients (opencode, etc.) cheerfully
+    /// run the tools and send the next request, perpetuating the loop
+    /// from the outside. `"length"` is the OpenAI-spec slot for
+    /// "response was forcibly truncated" and gives every agent a
+    /// clean hook to break its outer retry loop.
+    pub(super) tool_loop_capped: bool,
     /// Streaming tool-call detector (`Some` iff `tools_active`).
     pub(super) detector: Option<tool_parser::StreamingToolDetector>,
     /// True iff the reasoning/`<think>` phase has finished. Starts
     /// `true` when the request did not enable thinking.
     pub(super) thinking_done: bool,
+    /// `return_token_ids`: sampled token IDs not yet attached to an
+    /// emitted chunk. One ID is pushed per `handle_token` call (== one
+    /// sampled token == one increment of `usage.completion_tokens`),
+    /// then drained onto the next client-visible chunk. The sum of all
+    /// drained IDs across the stream therefore equals
+    /// `completion_tokens` exactly. Stays empty unless the request
+    /// opted in, so it costs nothing on the default path.
+    pub(super) pending_token_ids: Vec<u32>,
 }
 
 impl StreamState {
@@ -114,12 +134,14 @@ impl StreamState {
             streaming_tool_args: HashMap::new(),
             tool_calls_emitted_count: 0,
             name_run: None,
+            tool_loop_capped: false,
             detector: if tools_active {
                 Some(tool_parser::StreamingToolDetector::new())
             } else {
                 None
             },
             thinking_done: !enable_thinking,
+            pending_token_ids: Vec::new(),
         }
     }
 }
