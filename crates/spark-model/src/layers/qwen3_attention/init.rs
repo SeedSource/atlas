@@ -287,6 +287,11 @@ impl Qwen3AttentionLayer {
                 "mla_absorbed",
                 "mla_cache_assemble_batched",
             ),
+            prefill_attn_mla128_k: super::super::try_kernel(
+                gpu,
+                "mla_prefill_attn",
+                "mla_prefill_attn_128",
+            ),
             prefill_attn_mla320_k: super::super::try_kernel(
                 gpu,
                 "mla_prefill_attn",

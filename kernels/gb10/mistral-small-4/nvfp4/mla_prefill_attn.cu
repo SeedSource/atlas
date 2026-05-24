@@ -1,31 +1,129 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Simple MLA Prefill Attention for absorbed MLA (HDIM=320, GQA 32:1).
+// MLA Prefill Attention kernels — scalar BF16 dot products with FP32 accumulation.
 //
-// No tensor core MMA — uses scalar BF16 dot products with FP32 accumulation.
-// For typical prefill lengths (16-30 tokens), this is memory-bound and sufficient.
-// Avoids the SM121 PTX JIT issue with the tensor-core inferspark_prefill at HDIM=320.
+// Two variants:
+//   mla_prefill_attn_128  — unabsorbed MLA, head_dim=128 (nope=64 + rope=64)
+//   mla_prefill_attn_320  — absorbed MLA,   head_dim=320 (kv_lora_rank=256 + rope=64)
 //
-// Q: [batch, seq_len, num_q_heads, 320]
-// K: [batch, seq_len, 1, 320] (single KV head, broadcast to all Q heads)
-// V: [batch, seq_len, 1, 320]
-// O: [batch, seq_len, num_q_heads, 320]
+// Both use 256 threads, MLA_BR=16 query rows per tile, 16 lanes per row.
+// Each lane handles (head_dim / 16) elements: 8 for HDIM=128, 20 for HDIM=320.
 //
-// Grid: (num_q_heads, ceil(seq_len/BR), batch)
+// Grid: (num_q_heads, ceil(seq_len/MLA_BR), batch)
 // Block: (256, 1, 1)
 
 #include <cuda_bf16.h>
 #include <float.h>
 
-#define MLA_HDIM 320
-#define MLA_BR 16     // query tile size (smaller than 32 to reduce shared mem)
+#define MLA_BR 16     // query tile size
 #define MLA_BC 16     // KV tile size
 
+// ---------------------------------------------------------------------------
+// mla_prefill_attn_128  — unabsorbed MLA, head_dim=128 (nope=64 + rope=64)
+// ---------------------------------------------------------------------------
+// 256 threads, 16 lanes per query row → 16 query rows per tile.
+// Each lane handles 8 elements (128 / 16 = 8).
+extern "C" __global__ void mla_prefill_attn_128(
+    const __nv_bfloat16* __restrict__ Q,
+    const __nv_bfloat16* __restrict__ K,
+    const __nv_bfloat16* __restrict__ V,
+    __nv_bfloat16* __restrict__ O,
+    unsigned int seq_len,
+    unsigned int num_q_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,   // should be 128
+    float inv_sqrt_d,
+    unsigned int causal
+) {
+    const unsigned int q_head  = blockIdx.x;
+    const unsigned int q_block = blockIdx.y;
+    const unsigned int batch   = blockIdx.z;
+    const unsigned int tid     = threadIdx.x;
+
+    if (q_head >= num_q_heads) return;
+
+    const unsigned int q_start = q_block * MLA_BR;
+    if (q_start >= seq_len) return;
+    const unsigned int q_end = min(q_start + MLA_BR, seq_len);
+
+    const unsigned int gqa_ratio = num_q_heads / max(num_kv_heads, 1u);
+    const unsigned int kv_head   = q_head / gqa_ratio;
+
+    const unsigned int q_stride  = num_q_heads * head_dim;
+    const unsigned int kv_stride = num_kv_heads * head_dim;
+
+    const __nv_bfloat16* Q_base = Q + (unsigned long long)batch * seq_len * q_stride;
+    const __nv_bfloat16* K_base = K + (unsigned long long)batch * seq_len * kv_stride;
+    const __nv_bfloat16* V_base = V + (unsigned long long)batch * seq_len * kv_stride;
+    __nv_bfloat16*       O_base = O + (unsigned long long)batch * seq_len * q_stride;
+
+    // 16 lanes per row; 2 sub-warps share each 32-thread warp.
+    const unsigned int q_row    = tid / 16;
+    const unsigned int lane     = tid % 16;
+    const unsigned int warp_lane = tid % 32;
+
+    if (q_row >= (q_end - q_start)) return;
+
+    const unsigned int q_pos  = q_start + q_row;
+    const __nv_bfloat16* Q_row = Q_base + (unsigned long long)q_pos * q_stride + q_head * head_dim;
+
+    float m_prev = -FLT_MAX;
+    float l_prev = 0.0f;
+    float acc_o[8];  // 128 / 16 = 8 elements per lane
+    for (int i = 0; i < 8; i++) acc_o[i] = 0.0f;
+
+    unsigned int kv_end_pos = causal ? min(q_pos + 1, seq_len) : seq_len;
+    for (unsigned int kv_start = 0; kv_start < kv_end_pos; kv_start += MLA_BC) {
+        unsigned int kv_block_end = min(kv_start + MLA_BC, kv_end_pos);
+        for (unsigned int kv_pos = kv_start; kv_pos < kv_block_end; kv_pos++) {
+            const __nv_bfloat16* K_row = K_base + (unsigned long long)kv_pos * kv_stride + kv_head * head_dim;
+
+            // Each lane covers elements [lane*8, lane*8+8).
+            float dot = 0.0f;
+            for (unsigned int d = lane * 8; d < min((lane + 1) * 8u, head_dim); d++) {
+                dot += __bfloat162float(Q_row[d]) * __bfloat162float(K_row[d]);
+            }
+            for (int offset = 8; offset > 0; offset >>= 1)
+                dot += __shfl_down_sync(0xFFFFFFFF, dot, offset);
+            float score = dot * inv_sqrt_d;
+            if (causal && kv_pos > q_pos) score = -FLT_MAX;
+            score = __shfl_sync(0xFFFFFFFF, score, (warp_lane / 16) * 16);
+
+            float m_new = fmaxf(m_prev, score);
+            float alpha = expf(m_prev - m_new);
+            float p     = expf(score - m_new);
+            float l_new = alpha * l_prev + p;
+
+            const __nv_bfloat16* V_row = V_base + (unsigned long long)kv_pos * kv_stride + kv_head * head_dim;
+            for (int i = 0; i < 8; i++) {
+                unsigned int d = lane * 8 + i;
+                if (d < head_dim) {
+                    acc_o[i] = alpha * acc_o[i] + p * __bfloat162float(V_row[d]);
+                }
+            }
+            m_prev = m_new;
+            l_prev = l_new;
+        }
+    }
+
+    float inv_l = (l_prev > 0.0f) ? (1.0f / l_prev) : 0.0f;
+    __nv_bfloat16* O_row = O_base + (unsigned long long)q_pos * q_stride + q_head * head_dim;
+    for (int i = 0; i < 8; i++) {
+        unsigned int d = lane * 8 + i;
+        if (d < head_dim) O_row[d] = __float2bfloat16(acc_o[i] * inv_l);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mla_prefill_attn_320  — absorbed MLA, head_dim=320 (kv_lora_rank=256 + rope=64)
+// ---------------------------------------------------------------------------
+// 256 threads, 16 lanes per query row → 16 query rows per tile.
+// Each lane handles 20 elements (320 / 16 = 20).
 extern "C" __global__ void mla_prefill_attn_320(
-    const __nv_bfloat16* __restrict__ Q,    // [batch, seq_len, num_q_heads, MLA_HDIM]
-    const __nv_bfloat16* __restrict__ K,    // [batch, seq_len, 1, MLA_HDIM]
-    const __nv_bfloat16* __restrict__ V,    // [batch, seq_len, 1, MLA_HDIM]
-    __nv_bfloat16* __restrict__ O,           // [batch, seq_len, num_q_heads, MLA_HDIM]
+    const __nv_bfloat16* __restrict__ Q,    // [batch, seq_len, num_q_heads, 320]
+    const __nv_bfloat16* __restrict__ K,    // [batch, seq_len, 1, 320]
+    const __nv_bfloat16* __restrict__ V,    // [batch, seq_len, 1, 320]
+    __nv_bfloat16* __restrict__ O,           // [batch, seq_len, num_q_heads, 320]
     unsigned int seq_len,
     unsigned int num_q_heads,
     unsigned int num_kv_heads,

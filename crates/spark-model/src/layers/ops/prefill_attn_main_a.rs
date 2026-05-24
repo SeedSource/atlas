@@ -99,6 +99,47 @@ pub fn prefill_attention_64(
         .launch(stream)
 }
 
+/// MLA unabsorbed prefill flash attention — HDIM=128 (nope=64+rope=64).
+///
+/// Scalar BF16 dot products with FP32 accumulators. BR=16 (256 threads,
+/// 16 lanes/row). Correct for MLA head_dim=128; the generic HDIM=256
+/// `inferspark_prefill` kernel over-reads into adjacent heads when hd=128.
+///
+/// Grid: (num_q_heads, ceil(seq_len/16), batch)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_mla128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k: DevicePtr,
+    v: DevicePtr,
+    output: DevicePtr,
+    seq_len: u32,
+    batch: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    inv_sqrt_d: f32,
+    causal: bool,
+    stream: u64,
+) -> Result<()> {
+    let br = 16u32;
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, div_ceil(seq_len, br), batch])
+        .block([256, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k)
+        .arg_ptr(v)
+        .arg_ptr(output)
+        .arg_u32(seq_len)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(if causal { 1 } else { 0 })
+        .launch(stream)
+}
+
 /// Contiguous prefill Flash Attention — FP8 E4M3 K/V variant (BR=64).
 ///
 /// Q is BF16, K/V are FP8 E4M3 (dequantized to BF16 in shared memory).
