@@ -113,6 +113,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ATLAS_TARGET_HW");
     println!("cargo:rerun-if-env-changed=ATLAS_TARGET_MODEL");
     println!("cargo:rerun-if-env-changed=ATLAS_TARGET_QUANT");
+    // ATLAS_EXTRA_NVCC_FLAGS — global nvcc-flag override read by
+    // `build_target::NvidiaTarget::compile`. Used for kernel bisection
+    // tests (e.g. `-DATLAS_FAST_SOFTMAX_EXP=1` to flip the softmax
+    // polynomial vs `__expf` `#ifdef` choice).
+    println!("cargo:rerun-if-env-changed=ATLAS_EXTRA_NVCC_FLAGS");
     // Auto-skip the kernel build on macOS unless an explicit Apple Metal
     // target was selected. The default `gb10` target is NVIDIA-only and
     // cannot find nvcc on a Mac. Phase 2 onwards will populate

@@ -135,9 +135,16 @@ extern "C" __global__ void KERNEL_NAME(
     __shared__ __nv_bfloat16 smem_Q[BR][HDIM_PAD];
     __shared__ __nv_bfloat16 smem_K[2][BC][HDIM_PAD];  // double-buffered
     __shared__ __nv_bfloat16 smem_V[BC][HDIM_PAD];
-    // Phase 2c: smem_P now FP16 (10-bit mantissa) vs BF16 (7-bit).
+    // Phase 2c: smem_P FP16 (10-bit mantissa) vs BF16 (7-bit).
     // Read back as 2x packed FP16 per .b32 register for the .f16.f16 MMA.
+    // Bisect: `ATLAS_DISABLE_FP16_PV` reverts the Phase 2c FP16 P×V path
+    // to the pre-Phase-2b BF16 P×V (smem_P=BF16, store via
+    // __float2bfloat16_rn, .bf16.bf16 MMA, direct V read).
+#ifdef ATLAS_DISABLE_FP16_PV
+    __shared__ __nv_bfloat16 smem_P[BR][BC + PAD_P];
+#else
     __shared__ __half smem_P[BR][BC + PAD_P];
+#endif
     __shared__ float smem_ml[BR][2];
 
     KERNEL_PREAMBLE
@@ -295,8 +302,13 @@ extern "C" __global__ void KERNEL_NAME(
                 float p10=sw_exp(acc_s[nt][2]-m_r1),p11=sw_exp(acc_s[nt][3]-m_r1);
                 sum0+=p00+p01; sum1+=p10+p11;
                 unsigned int c0=nt*8+tid_in_group*2;
+#ifdef ATLAS_DISABLE_FP16_PV
+                smem_P[row0][c0]=__float2bfloat16_rn(p00); smem_P[row0][c0+1]=__float2bfloat16_rn(p01);
+                smem_P[row1][c0]=__float2bfloat16_rn(p10); smem_P[row1][c0+1]=__float2bfloat16_rn(p11);
+#else
                 smem_P[row0][c0]=__float2half_rn(p00); smem_P[row0][c0+1]=__float2half_rn(p01);
                 smem_P[row1][c0]=__float2half_rn(p10); smem_P[row1][c0+1]=__float2half_rn(p11);
+#endif
             }
             sum0+=__shfl_xor_sync(0xFFFFFFFF,sum0,1); sum0+=__shfl_xor_sync(0xFFFFFFFF,sum0,2);
             sum1+=__shfl_xor_sync(0xFFFFFFFF,sum1,1); sum1+=__shfl_xor_sync(0xFFFFFFFF,sum1,2);
@@ -340,6 +352,8 @@ extern "C" __global__ void KERNEL_NAME(
         // Phase 2c: FP16 inputs (vs prior BF16) — 8× finer P precision,
         // same MMA shape and throughput. V converted from BF16 to FP16
         // in registers per-MMA via bf16x2_to_f16x2_bits.
+        // Bisect: ATLAS_DISABLE_FP16_PV reverts to the pre-Phase-2b BF16
+        // P×V MMA (direct smem_V read, .bf16.bf16 MMA op).
         {
             const unsigned short* sP=(const unsigned short*)smem_P;
             #pragma unroll
@@ -354,6 +368,16 @@ extern "C" __global__ void KERNEL_NAME(
                 #pragma unroll
                 for(int nt=0;nt<N_TILES_PER_WARP;nt++){
                     unsigned int nc=(pv_n_start+nt)*8+group_id, k0=ko+tid_in_group*2, k1=k0+8;
+#ifdef ATLAS_DISABLE_FP16_PV
+                    const unsigned short* sV=(const unsigned short*)smem_V;
+                    unsigned int b0=((unsigned int)sV[(k0+1)*HDIM_PAD+nc]<<16)|(unsigned int)sV[k0*HDIM_PAD+nc];
+                    unsigned int b1=((unsigned int)sV[(k1+1)*HDIM_PAD+nc]<<16)|(unsigned int)sV[k1*HDIM_PAD+nc];
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                        :"=f"(acc_o[nt][0]),"=f"(acc_o[nt][1]),"=f"(acc_o[nt][2]),"=f"(acc_o[nt][3])
+                        :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),
+                         "f"(acc_o[nt][0]),"f"(acc_o[nt][1]),"f"(acc_o[nt][2]),"f"(acc_o[nt][3]));
+#else
                     unsigned int b0=bf16x2_to_f16x2_bits(
                         smem_V[k0][nc], smem_V[k0+1][nc]);
                     unsigned int b1=bf16x2_to_f16x2_bits(
@@ -363,6 +387,7 @@ extern "C" __global__ void KERNEL_NAME(
                         :"=f"(acc_o[nt][0]),"=f"(acc_o[nt][1]),"=f"(acc_o[nt][2]),"=f"(acc_o[nt][3])
                         :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),
                          "f"(acc_o[nt][0]),"f"(acc_o[nt][1]),"f"(acc_o[nt][2]),"f"(acc_o[nt][3]));
+#endif
                 }
             }
         }
@@ -484,8 +509,12 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
     __shared__ __nv_bfloat16 smem_Q64[BR64][HDIM_PAD];
     __shared__ __nv_bfloat16 smem_K64[2][BC][HDIM_PAD];
     __shared__ __nv_bfloat16 smem_V64[BC][HDIM_PAD];
-    // Phase 2c: smem_P64 now FP16 — same rationale as smem_P above.
+    // Phase 2c: smem_P64 FP16 — same rationale as smem_P above.
+#ifdef ATLAS_DISABLE_FP16_PV
+    __shared__ __nv_bfloat16 smem_P64[BR64][BC + PAD_P];
+#else
     __shared__ __half smem_P64[BR64][BC + PAD_P];
+#endif
     __shared__ float smem_ml64[BR64][2];
 
     KERNEL_PREAMBLE
@@ -634,8 +663,13 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 float p10=sw_exp(acc_s[nt][2]-m_r1),p11=sw_exp(acc_s[nt][3]-m_r1);
                 sum0+=p00+p01; sum1+=p10+p11;
                 unsigned int c0=nt*8+tid_in_group*2;
+#ifdef ATLAS_DISABLE_FP16_PV
+                smem_P64[row0][c0]=__float2bfloat16_rn(p00); smem_P64[row0][c0+1]=__float2bfloat16_rn(p01);
+                smem_P64[row1][c0]=__float2bfloat16_rn(p10); smem_P64[row1][c0+1]=__float2bfloat16_rn(p11);
+#else
                 smem_P64[row0][c0]=__float2half_rn(p00); smem_P64[row0][c0+1]=__float2half_rn(p01);
                 smem_P64[row1][c0]=__float2half_rn(p10); smem_P64[row1][c0+1]=__float2half_rn(p11);
+#endif
             }
             sum0+=__shfl_xor_sync(0xFFFFFFFF,sum0,1); sum0+=__shfl_xor_sync(0xFFFFFFFF,sum0,2);
             sum1+=__shfl_xor_sync(0xFFFFFFFF,sum1,1); sum1+=__shfl_xor_sync(0xFFFFFFFF,sum1,2);
@@ -697,6 +731,16 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                 #pragma unroll
                 for(int nt=0;nt<N_TILES_PER_WARP;nt++){
                     unsigned int nc=(pv_n_start+nt)*8+group_id, k0=ko+tid_in_group*2, k1=k0+8;
+#ifdef ATLAS_DISABLE_FP16_PV
+                    const unsigned short* sV=(const unsigned short*)smem_V64;
+                    unsigned int b0=((unsigned int)sV[(k0+1)*HDIM_PAD+nc]<<16)|(unsigned int)sV[k0*HDIM_PAD+nc];
+                    unsigned int b1=((unsigned int)sV[(k1+1)*HDIM_PAD+nc]<<16)|(unsigned int)sV[k1*HDIM_PAD+nc];
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                        :"=f"(acc_o[nt][0]),"=f"(acc_o[nt][1]),"=f"(acc_o[nt][2]),"=f"(acc_o[nt][3])
+                        :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),
+                         "f"(acc_o[nt][0]),"f"(acc_o[nt][1]),"f"(acc_o[nt][2]),"f"(acc_o[nt][3]));
+#else
                     unsigned int b0=bf16x2_to_f16x2_bits(
                         smem_V64[k0][nc], smem_V64[k0+1][nc]);
                     unsigned int b1=bf16x2_to_f16x2_bits(
@@ -706,6 +750,7 @@ extern "C" __global__ void PAGED_CONCAT(KERNEL_NAME, _64)(
                         :"=f"(acc_o[nt][0]),"=f"(acc_o[nt][1]),"=f"(acc_o[nt][2]),"=f"(acc_o[nt][3])
                         :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),
                          "f"(acc_o[nt][0]),"f"(acc_o[nt][1]),"f"(acc_o[nt][2]),"f"(acc_o[nt][3]));
+#endif
                 }
             }
         }

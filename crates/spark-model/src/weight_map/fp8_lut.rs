@@ -159,6 +159,13 @@ pub(super) fn fp8_e4m3_to_f32(bits: u8) -> f32 {
 /// through this helper.
 #[inline(always)]
 pub(super) fn f32_to_bf16(val: f32) -> u16 {
+    // Phase 2c day-2 bisect: ATLAS_DISABLE_RNE=1 reverts the Phase 2b
+    // round-to-nearest-even patch back to truncation. Used to isolate
+    // whether RNE accounts for the observed cosine regression vs the
+    // May 23 rne baseline.
+    if std::env::var("ATLAS_DISABLE_RNE").is_ok() {
+        return (val.to_bits() >> 16) as u16;
+    }
     let bits = val.to_bits();
     if val.is_nan() {
         let sign = ((bits >> 16) & 0x8000) as u16;
