@@ -10,8 +10,6 @@
 
 use crate::openai::ChatCompletionRequest;
 
-use super::msg_entry::MsgEntry;
-
 pub(super) struct LoopDetectOut {
     /// True when the verdict was Suppress OR spinning detection
     /// fired. Caller flips the `<tool_call>` token bias to avoid
@@ -24,8 +22,6 @@ pub(super) struct LoopDetectOut {
 
 pub(super) fn check_loops(
     req: &ChatCompletionRequest,
-    messages: &mut [MsgEntry],
-    consecutive_tool_errors: u32,
     tools_active: bool,
 ) -> LoopDetectOut {
     let mut suppress_tool_call = false;
@@ -125,60 +121,6 @@ pub(super) fn check_loops(
             "Spinning detection fired — suppressing <tool_call>"
         );
         suppress_tool_call = true;
-    }
-
-    // Single hint, used for both Suppress and Hint verdicts.
-    let loop_active = !matches!(verdict, crate::loop_detector::LoopState::None);
-    let inject_hint = loop_active || spinning;
-    if inject_hint {
-        let hint = "\n\n<IMPORTANT>\nYour recent turns have produced \
-                    output very similar to earlier turns. Before \
-                    continuing: (1) inspect the CURRENT state with \
-                    read-only tools so you can see what is already \
-                    done; (2) if the user's request is already \
-                    satisfied, summarise and stop; (3) otherwise \
-                    identify the SPECIFIC remaining gap and address \
-                    only that — do not retry the same approach or \
-                    regenerate work that already exists.\n</IMPORTANT>";
-        if let Some(last) = messages.last_mut() {
-            last.content.push_str(hint);
-        }
-    }
-
-    // Goal re-anchor (P1.3 + #4 per-turn spread).
-    if crate::task_pin::should_inject(loop_active || spinning, consecutive_tool_errors)
-        && let Some(goal) = crate::task_pin::extract_original_goal(&req.messages, |m| {
-            (m.role.as_str(), m.content.text.as_str())
-        })
-    {
-        let n_failures = consecutive_tool_errors as usize + tool_call_repeat_count;
-        let reminder = crate::task_pin::build_reminder(goal, n_failures.max(1));
-        // Find indices of the last two tool/user messages.
-        let mut anchor_idxs: Vec<usize> = Vec::with_capacity(2);
-        for (i, m) in messages.iter().enumerate().rev() {
-            if m.role == "tool" || m.role == "user" {
-                anchor_idxs.push(i);
-                if anchor_idxs.len() >= 2 {
-                    break;
-                }
-            }
-        }
-        let anchored_count = anchor_idxs.len();
-        for idx in anchor_idxs {
-            messages[idx].content.push_str(&reminder);
-        }
-        // Fallback: still anchor on the last message.
-        if anchored_count == 0
-            && let Some(last) = messages.last_mut()
-        {
-            last.content.push_str(&reminder);
-        }
-        tracing::info!(
-            n_failures,
-            anchored_count = anchored_count.max(1),
-            "task_pin: injected verbatim-goal reminder"
-        );
-        crate::metrics::TASK_PIN_INJECTIONS.inc();
     }
 
     LoopDetectOut {

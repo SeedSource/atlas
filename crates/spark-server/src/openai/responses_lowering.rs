@@ -46,13 +46,10 @@ pub fn lower_responses_to_chat(
     }
 
     if let Some(instr) = r.instructions.clone() {
-        // Per the Responses spec, only the CURRENT turn's `instructions`
-        // should apply. If we're resuming via previous_response_id, the
-        // prior transcript may already contain a synthetic-system
-        // message — drop it so the new instructions don't stack.
-        // Also insert at position 0 so the chat template sees system
-        // first (the conventional layout).
-        messages.retain(|m| m.role != "system");
+        // Per the Responses spec, `instructions` becomes a synthetic
+        // system message at position 0. No scanning, no dropping of
+        // prior synthetic-system messages — the resumed transcript is
+        // attached verbatim.
         messages.insert(0, IncomingMessage::synthetic_system(instr));
     }
     match &r.input {

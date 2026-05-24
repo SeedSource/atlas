@@ -12,10 +12,8 @@ use std::sync::Arc;
 
 use crate::AppState;
 use crate::openai::ChatCompletionRequest;
-use crate::tool_parser;
 
 use super::super::compact::{compact_messages, openai_error_response};
-use super::super::failures::strip_xml_leaks_from_assistant_content;
 use super::msg_entry::MsgEntry;
 
 /// Outputs of [`render_template`]. Threaded into the streaming /
@@ -42,19 +40,9 @@ pub(super) fn render_template(
     let template_thinking = enable_thinking;
 
     // Build JSON messages with structured tool_calls for Jinja.
-    let stripper_tools: &[tool_parser::ToolDefinition] = req.tools.as_deref().unwrap_or(&[]);
     let json_messages: Vec<serde_json::Value> = messages
         .iter()
         .map(|m| {
-            let effective_content = if m.role == "assistant"
-                && m.tool_calls.as_ref().is_some_and(|tcs| !tcs.is_empty())
-                && !stripper_tools.is_empty()
-                && m.image_count == 0
-            {
-                strip_xml_leaks_from_assistant_content(&m.content, stripper_tools)
-            } else {
-                m.content.clone()
-            };
             let content_val = if m.image_count > 0 {
                 let mut items: Vec<serde_json::Value> = Vec::with_capacity(m.image_count + 1);
                 for _ in 0..m.image_count {
@@ -65,7 +53,7 @@ pub(super) fn render_template(
                 }
                 serde_json::Value::Array(items)
             } else {
-                serde_json::Value::String(effective_content)
+                serde_json::Value::String(m.content.clone())
             };
             let mut msg = serde_json::json!({"role": m.role, "content": content_val});
             if let Some(ref tcs) = m.tool_calls {

@@ -13,8 +13,8 @@ use axum::response::sse::Event;
 use crate::openai::ChatCompletionChunk;
 use crate::tool_parser;
 
-use super::super::failures::{bump_f12_tool_call_count, check_loop_watchdog};
 use super::super::sanitizer::sanitize_content_chunk;
+use super::super::stream_guards::{bump_f12_tool_call_count, check_loop_watchdog};
 use super::ctx::StreamCtx;
 use super::state::StreamState;
 use super::strip::{

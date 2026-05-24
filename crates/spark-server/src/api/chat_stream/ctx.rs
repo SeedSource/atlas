@@ -9,8 +9,6 @@ use std::sync::Arc;
 use crate::AppState;
 use crate::tool_parser;
 
-use super::super::failures::F39FailureCache;
-
 pub(super) struct StreamCtx {
     pub(super) state: Arc<AppState>,
     pub(super) model: String,
@@ -25,6 +23,4 @@ pub(super) struct StreamCtx {
     pub(super) req_stream_include_usage: bool,
     pub(super) req_ctx: Option<crate::rate_limiter::RequestContext>,
     pub(super) dump_seq: Option<u64>,
-    pub(super) f44_cache: F39FailureCache,
-    pub(super) f44_cache_active: bool,
 }

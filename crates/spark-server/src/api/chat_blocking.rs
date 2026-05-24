@@ -18,7 +18,6 @@ use crate::openai::{ChatCompletionRequest, ChatCompletionResponse, Usage};
 use crate::tool_parser;
 
 use super::compact::openai_error_response;
-use super::failures::f60_disable_mtp_for_request;
 use super::inference_impl::{extract_thinking, strip_stop_sequences};
 use super::inference_types::{GrammarSpec, InferenceRequest};
 
@@ -131,7 +130,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> Response {
             thinking_budget,
             require_tool_call: tool_choice_required,
             suppress_tool_call,
-            disable_mtp: f60_disable_mtp_for_request(tools_active),
+            disable_mtp: false,
             grammar_spec: grammar_spec.clone(),
             seed: req.seed.map(|s| s.wrapping_add(choice_idx as u64)),
             top_logprobs,

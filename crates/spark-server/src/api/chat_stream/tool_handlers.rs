@@ -10,9 +10,7 @@ use axum::response::sse::Event;
 use crate::openai::ChatCompletionChunk;
 use crate::tool_parser;
 
-use super::super::failures::{
-    bump_f12_tool_call_count, f44_check_permanent_failure, flush_content_sanitizer,
-};
+use super::super::stream_guards::{bump_f12_tool_call_count, flush_content_sanitizer};
 use super::ctx::StreamCtx;
 use super::state::StreamState;
 
@@ -242,21 +240,12 @@ pub(super) fn handle_tool_call_delta(
 /// strictly tighter than F11 and F12 for the runaway pattern.
 const MAX_CONSEC_SAME_NAME_CALLS: u32 = 6;
 
-pub(super) fn handle_tool_call_end(state: &mut StreamState, ctx: &StreamCtx, idx: usize) {
+pub(super) fn handle_tool_call_end(state: &mut StreamState, _ctx: &StreamCtx, idx: usize) {
     if let Some((name, args_json)) = state.streaming_tool_args.remove(&idx) {
         if state.tool_arg_dedup_within.check(&name, &args_json) {
             tracing::warn!(
                 tool = %name,
                 "F11 within-response dedup tripped: 2+ identical streaming tool calls; ending response"
-            );
-            state.stop_string_triggered = true;
-            state.tool_loop_capped = true;
-        } else if ctx.f44_cache_active
-            && f44_check_permanent_failure(&ctx.f44_cache, &name, &args_json)
-        {
-            tracing::warn!(
-                tool = %name,
-                "F44 streaming circuit-breaker tripped: tool_call matches a permanently-failed prior call; ending response"
             );
             state.stop_string_triggered = true;
             state.tool_loop_capped = true;

@@ -41,7 +41,6 @@ pub(super) struct BuildOut {
     pub(super) cwd_hint: Option<String>,
     pub(super) image_pixels: Vec<(Vec<f32>, usize, usize)>,
     pub(super) image_pad_counts: Vec<usize>,
-    pub(super) consecutive_tool_errors: u32,
 }
 
 #[allow(clippy::result_large_err)]
@@ -228,7 +227,6 @@ pub(super) fn build_msg_entries(
         cwd_hint,
         image_pixels,
         image_pad_counts,
-        consecutive_tool_errors,
     })
 }
 

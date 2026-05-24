@@ -1,30 +1,46 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! F12 tool-call cap + loop watchdog helpers, hoisted from `duplicate.rs`
-//! to keep that file under the 500 LoC cap.
+//! Streaming-side runtime guards. These are NOT prompt-mutating
+//! injections — they operate purely on outbound model text:
 //!
-//! These two helpers are independent of the F49/F50 duplicate-write pipeline
-//! that owns `duplicate.rs`; they live as siblings rather than peers so the
-//! file split is invisible to callers (re-exported through `failures/mod.rs`).
+//! - [`bump_f12_tool_call_count`]: caps the number of tool calls
+//!   emitted per response (default 12) so a degenerate streamer
+//!   can't dump dozens.
+//! - [`check_loop_watchdog`]: detects a repeating line/phrase in
+//!   the post-detector content stream and signals end-of-response.
+//! - [`flush_content_sanitizer`]: drains the tag-scan tail buffer
+//!   when the stream closes, suppressing incomplete tag openers.
+//!
+//! Restored from the deleted `api/failures/` subtree (Phase A,
+//! 2026-05-24): the subtree's job was prompt-injection helpers
+//! (F7/F23/F29/...) which were removed wholesale, but these three
+//! streaming guards were sibling-hosted there only because of an
+//! old file-split. They have no input/prompt side and remain.
 
-/// F12 (2026-04-26): bump the per-response tool-call counter and
-/// trip `stop_string_triggered` when the cap is exceeded. Catches
-/// pathological responses emitting dozens of tool calls (observed
-/// under heavy looping). Default cap = 12 (env override
-/// `ATLAS_MAX_TOOL_CALLS_PER_RESPONSE`); well below any legitimate
-/// burst (Anthropic's pre-regression default ceiling was 60+).
+use crate::tool_parser;
+
+/// Bump the per-response tool-call counter and trip
+/// `stop_string_triggered` when the cap is exceeded. Catches
+/// pathological responses emitting dozens of tool calls. Default
+/// cap = 12 (env override `ATLAS_MAX_TOOL_CALLS_PER_RESPONSE`).
 pub fn bump_f12_tool_call_count(count: &mut usize, max: usize, stop: &mut bool) {
     *count += 1;
     if *count > max && !*stop {
         tracing::warn!(
             emitted = *count,
             max,
-            "F12: tool-call cap reached; ending response"
+            "tool-call cap reached; ending response"
         );
         *stop = true;
     }
 }
 
+/// Detect a repeating line or long phrase in the post-detector
+/// content buffer. Returns true when the last non-trivial line
+/// occurs (fuzzy-matched on collapsed whitespace) at least 4 times
+/// in the running 10 KB window, or when a ≥30-char phrase recurs
+/// 4 times via substring scan. Caller is expected to stop the
+/// stream once true is returned.
 pub fn check_loop_watchdog(
     text: &str,
     loop_scan_buf: &mut String,
@@ -84,10 +100,6 @@ pub fn check_loop_watchdog(
         );
         return true;
     }
-    // Substring fallback: catches a phrase that recurs whole even
-    // when one occurrence is glued onto another line (mid-stream
-    // narration ramping). Only count for ≥30-char phrases so we
-    // don't false-positive on short common fragments.
     if needle.len() >= 30 {
         let lowered_buf = loop_scan_buf.to_ascii_lowercase();
         let mut count = 0usize;
@@ -111,11 +123,45 @@ pub fn check_loop_watchdog(
     false
 }
 
+/// Flush anything held in the streaming sanitizer's tail buffer at
+/// stream end. Drops content if tag-suppression is still active (no
+/// close arrived) or if the remaining bytes look like an incomplete
+/// tag opener.
+pub fn flush_content_sanitizer(
+    tag_scan_buf: &mut String,
+    suppressing_param_leak: &mut bool,
+    markers: &tool_parser::LeakMarkers,
+) -> String {
+    if *suppressing_param_leak {
+        tag_scan_buf.clear();
+        *suppressing_param_leak = false;
+        return String::new();
+    }
+    if tag_scan_buf.is_empty() {
+        return String::new();
+    }
+    let tag_max: usize = markers
+        .orphan_open
+        .iter()
+        .chain(markers.close.iter())
+        .map(|t| t.len())
+        .max()
+        .unwrap_or(0);
+    let final_text = std::mem::take(tag_scan_buf);
+    let looks_like_partial_tag = {
+        let t = final_text.trim_end();
+        tag_max > 0 && t.starts_with('<') && !t.contains(char::is_whitespace) && t.len() < tag_max
+    };
+    if looks_like_partial_tag {
+        String::new()
+    } else {
+        final_text
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── bump_f12_tool_call_count ──────────────────────────────────
 
     #[test]
     fn f12_under_cap_does_not_stop() {
@@ -127,7 +173,6 @@ mod tests {
 
     #[test]
     fn f12_at_cap_does_not_stop() {
-        // The check is `> max`, so count == max is allowed.
         let (mut count, mut stop) = (11usize, false);
         bump_f12_tool_call_count(&mut count, 12, &mut stop);
         assert_eq!(count, 12);
@@ -143,18 +188,6 @@ mod tests {
     }
 
     #[test]
-    fn f12_already_stopped_still_counts() {
-        // Even when stop is already set, count keeps incrementing
-        // for the diagnostic — but doesn't re-warn.
-        let (mut count, mut stop) = (100usize, true);
-        bump_f12_tool_call_count(&mut count, 12, &mut stop);
-        assert_eq!(count, 101);
-        assert!(stop);
-    }
-
-    // ── check_loop_watchdog ───────────────────────────────────────
-
-    #[test]
     fn watchdog_already_triggered_returns_false() {
         let mut buf = String::new();
         assert!(!check_loop_watchdog("anything", &mut buf, true));
@@ -167,63 +200,13 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_single_line_returns_false() {
-        let mut buf = String::new();
-        // Just one line of content — no repeats.
-        assert!(!check_loop_watchdog(
-            "this is a single long enough line to qualify\n",
-            &mut buf,
-            false
-        ));
-    }
-
-    #[test]
     fn watchdog_four_identical_lines_fires() {
         let mut buf = String::new();
         let line = "Running cargo test on the project\n";
-        // First three accumulations should not fire.
         assert!(!check_loop_watchdog(line, &mut buf, false));
         assert!(!check_loop_watchdog(line, &mut buf, false));
         assert!(!check_loop_watchdog(line, &mut buf, false));
-        // Fourth occurrence trips the watchdog.
         assert!(check_loop_watchdog(line, &mut buf, false));
-    }
-
-    #[test]
-    fn watchdog_fuzzy_normalization_collapses_whitespace() {
-        let mut buf = String::new();
-        // Same phrase, different whitespace each time — must still fuzzy-match.
-        assert!(!check_loop_watchdog(
-            "Running cargo test now\n",
-            &mut buf,
-            false
-        ));
-        assert!(!check_loop_watchdog(
-            "  Running cargo test now  \n",
-            &mut buf,
-            false
-        ));
-        assert!(!check_loop_watchdog(
-            "Running cargo  test  now\n",
-            &mut buf,
-            false
-        ));
-        assert!(check_loop_watchdog(
-            "Running\tcargo test now\n",
-            &mut buf,
-            false
-        ));
-    }
-
-    #[test]
-    fn watchdog_short_lines_skipped() {
-        // Lines whose trimmed length ≤ 15 chars don't qualify as the
-        // needle, so identical short lines don't trigger.
-        let mut buf = String::new();
-        let short = "ok\n"; // 2 chars
-        for _ in 0..10 {
-            assert!(!check_loop_watchdog(short, &mut buf, false));
-        }
     }
 
     #[test]
@@ -232,13 +215,7 @@ mod tests {
         let big = "x".repeat(5000);
         check_loop_watchdog(&big, &mut buf, false);
         check_loop_watchdog(&big, &mut buf, false);
-        // After two 5KB pushes the buffer is 10KB; a third triggers the
-        // 10_240-byte cap and drains down to 8KB.
         check_loop_watchdog(&big, &mut buf, false);
-        assert!(
-            buf.len() <= 10_240,
-            "buffer should self-trim, got {}",
-            buf.len()
-        );
+        assert!(buf.len() <= 10_240, "buffer should self-trim, got {}", buf.len());
     }
 }

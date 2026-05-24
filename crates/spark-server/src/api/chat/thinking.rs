@@ -13,8 +13,6 @@ use std::sync::Arc;
 use crate::AppState;
 use crate::openai::ChatCompletionRequest;
 
-use super::super::failures::recent_message_is_tool_error;
-
 pub(super) fn resolve_thinking(
     state: &Arc<AppState>,
     req: &ChatCompletionRequest,
@@ -32,13 +30,6 @@ pub(super) fn resolve_thinking(
         && !state.behavior.thinking_in_tools
         && !req.thinking_explicitly_requested()
     {
-        false
-    } else {
-        et
-    };
-    // F28: auto-disable thinking on turns following a tool error.
-    let et = if et && recent_message_is_tool_error(&req.messages) {
-        tracing::info!("F28: disabling thinking on this turn (most recent message is tool error)");
         false
     } else {
         et
