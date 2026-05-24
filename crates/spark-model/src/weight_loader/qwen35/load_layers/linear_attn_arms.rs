@@ -16,10 +16,14 @@ use crate::weight_map::{
     interleave_ba, load_fp8_block_scaled_as_fp8weight, load_ssm_qwen35, quantize_to_nvfp4,
 };
 
-// Currently unused while the FP8 LinearAttention dispatch arm in the
-// caller (`load_layers.rs`) is short-circuited; preserved for the
-// in-progress FP8 GDN kernel work, see the comment in `load_layers.rs`
-// above the `LayerType::LinearAttention` arm.
+// Currently unused — see comment in `load_layers.rs` LinearAttention
+// arm. Re-enabling this function requires fixing the scale-shape
+// mismatch in `load_fp8_block_scaled_as_fp8weight` (which puts
+// per-block BF16 scales into `Fp8Weight::row_scale`, a field whose
+// contract is per-row F32). The concat at lines 56-61 below copies
+// `qkv_rows * 4` bytes assuming F32, but the source is a (N/BS)*(K/BS)
+// BF16 buffer that's much smaller — INVALID_VALUE at runtime
+// (verified live 2026-05-24).
 #[allow(dead_code, clippy::too_many_arguments)]
 pub(super) fn build_linear_attention_fp8(
     layer_idx: usize,

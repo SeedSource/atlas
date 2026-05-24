@@ -331,15 +331,24 @@ pub(super) fn load_layers(
                 layers.push(layer);
                 attn_idx += 1;
             }
-            // LinearAttention native-FP8 path was previously wired here as
-            // `if native_fp8 && false => build_linear_attention_fp8(...)`
-            // but the FP8 GDN kernels are still stabilizing and the arm
-            // was permanently short-circuited. The NVFP4 fallback below
-            // handles every LinearAttention layer regardless of `native_fp8`.
-            // To re-enable: revive the call to
-            // `linear_attn_arms::build_linear_attention_fp8` in this arm
-            // and gate it behind a real predicate (env-var or feature
-            // flag), not a literal `false`.
+            // LinearAttention dispatch.
+            //
+            // The native-FP8 LinearAttention arm `build_linear_attention_fp8`
+            // (linear_attn_arms.rs:24) cannot be enabled without further
+            // kernel work: it relies on per-row F32 scales in
+            // `Fp8Weight::row_scale`, but Qwen3.6's FP8 checkpoint ships
+            // per-BLOCK BF16 scales (shape `[N/BS, K/BS]`).
+            // `load_fp8_block_scaled_as_fp8weight` stuffs those block scales
+            // into `row_scale` and downstream code reads them as per-row F32,
+            // causing a `cuMemcpyDtoDAsync_v2 INVALID_VALUE` at layer 0 the
+            // moment a concat tries to copy `N * 4` bytes from a `(N/BS) *
+            // (K/BS) * 2`-byte buffer (verified live 2026-05-24).
+            //
+            // Until the SSM FP8 kernel chain (`fp8_gemm_n128`) is rewritten
+            // to consume block scales, this arm stays on the NVFP4 path even
+            // for `Fp8Dequanted`. The CAUSAL-PATHWAY-AUDIT Bug #1 remains
+            // open; switching to the NVFP4 checkpoint (RedHatAI/...-NVFP4)
+            // is the production workaround.
             LayerType::LinearAttention => {
                 let layer = linear_attn_arms::build_linear_attention_nvfp4(
                     store,
