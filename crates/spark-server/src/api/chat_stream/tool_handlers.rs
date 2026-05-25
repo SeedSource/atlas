@@ -43,10 +43,18 @@ pub(super) fn handle_complete_tool_call(
     if let Some(ref cwd) = ctx.cwd_for_normalize {
         tool_parser::normalize_paths(std::slice::from_mut(tc), cwd);
     }
-    if let Err(e) = tool_parser::validate_single_tool_call(tc, &ctx.tool_defs_for_backfill) {
+    let validation = tool_parser::validate_single_tool_call(tc, &ctx.tool_defs_for_backfill);
+    let is_soft = validation
+        .as_ref()
+        .err()
+        .map(|e| e.contains("non-empty"))
+        .unwrap_or(false);
+    if let Err(e) = &validation
+        && !is_soft
+    {
         tracing::warn!(
             tool = %tc.function.name,
-            "tool call validation error: {e}; replacing with content and ending"
+            "tool call validation error (hard): {e}; replacing with content and ending"
         );
         let msg = format!("[atlas] Tool call rejected: {e}");
         let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, msg);
@@ -54,6 +62,41 @@ pub(super) fn handle_complete_tool_call(
             Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
         ));
         state.stop_string_triggered = true;
+    } else if let Err(e) = &validation {
+        // Soft validation error (empty required string) — emit the tool
+        // call as the model produced it and let opencode's per-tool
+        // schema surface its own actionable error. See
+        // `handle_tool_call_delta` for the rationale.
+        tracing::warn!(
+            tool = %tc.function.name,
+            "tool call validation error (soft): {e}; passing through to opencode"
+        );
+        bump_f12_tool_call_count(
+            &mut state.tool_calls_emitted_count,
+            ctx.max_tool_calls_per_response,
+            &mut state.stop_string_triggered,
+        );
+        let preview: String = tc.function.arguments.chars().take(120).collect();
+        let s = if tc.function.arguments.len() > preview.len() {
+            "…"
+        } else {
+            ""
+        };
+        tracing::info!("Tool call: {}({preview}{s})", tc.function.name);
+        crate::metrics::TOOL_CALLS_TOTAL.inc();
+        let start = ChatCompletionChunk::tool_call_start_chunk(&ctx.model, &ctx.id, tc, tc_idx);
+        sse_events.push(Ok(
+            Event::default().data(serde_json::to_string(&start).unwrap_or_default())
+        ));
+        let frag = ChatCompletionChunk::tool_call_args_fragment(
+            &ctx.model,
+            &ctx.id,
+            tc_idx,
+            &tc.function.arguments,
+        );
+        sse_events.push(Ok(
+            Event::default().data(serde_json::to_string(&frag).unwrap_or_default())
+        ));
     } else if state
         .tool_arg_dedup
         .check(&tc.function.name, &tc.function.arguments)
@@ -206,21 +249,48 @@ pub(super) fn handle_tool_call_delta(
             tool_parser::normalize_paths(std::slice::from_mut(&mut tc), cwd);
         }
         if let Err(e) = tool_parser::validate_single_tool_call(&tc, &ctx.tool_defs_for_backfill) {
-            tracing::warn!(
-                tool = %name,
-                "tool call validation error (stream Δ): {e}; replacing with content and ending"
-            );
-            let msg = format!("[atlas] Tool call rejected: {e}");
-            let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, msg);
-            sse_events.push(Ok(
-                Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
-            ));
-            state.stop_string_triggered = true;
-            entry.1.push_str(&args);
-            return;
+            // Mid-stream validation rejections used to emit a `[atlas] Tool
+            // call rejected: …` content chunk and trip `stop_string_triggered`
+            // — but `handle_tool_call_start` had already emitted the
+            // `tool_calls[idx]` header to opencode, so suppressing the args
+            // delta left opencode mid-call with no completion. opencode then
+            // reported `SchemaError(Missing key)`, a less actionable error
+            // than its own per-tool schema check (e.g. "The argument 'file'
+            // cannot be empty. Received ''").
+            //
+            // Empty-required-string failures (most common: F78 path tools,
+            // 2026-05-25 shell tools) are recoverable: emit the args delta
+            // as the model produced them and let opencode's per-tool schema
+            // surface its own actionable error to the model on the next
+            // turn. Hard failures (unknown tool name, args not valid JSON)
+            // still bail with a content chunk because they cannot be made
+            // into a complete tool call at all.
+            let is_soft = e.contains("non-empty");
+            if is_soft {
+                tracing::warn!(
+                    tool = %name,
+                    "tool call validation error (stream Δ, soft): {e}; passing through so opencode can surface its own per-tool schema error"
+                );
+                emit_args = tc.function.arguments.clone();
+                entry.1.push_str(&emit_args);
+            } else {
+                tracing::warn!(
+                    tool = %name,
+                    "tool call validation error (stream Δ, hard): {e}; replacing with content and ending"
+                );
+                let msg = format!("[atlas] Tool call rejected: {e}");
+                let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, msg);
+                sse_events.push(Ok(
+                    Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
+                ));
+                state.stop_string_triggered = true;
+                entry.1.push_str(&args);
+                return;
+            }
+        } else {
+            emit_args = tc.function.arguments.clone();
+            entry.1.push_str(&emit_args);
         }
-        emit_args = tc.function.arguments.clone();
-        entry.1.push_str(&emit_args);
     } else if !args.is_empty() {
         // No prior ToolCallStart for this idx — keep legacy passthrough.
     }
