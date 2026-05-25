@@ -404,6 +404,35 @@ pub fn validate_single_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> R
             }
         }
     }
+    // Shell-execution tools must have a non-empty command. Mirrors F78
+    // for the Write family. Without this, the `any_text` qwen3_coder
+    // body grammar (2026-05-25) accepts an immediately-closed parameter
+    // `<parameter=command></parameter>`; opencode's bash handler then
+    // returns "The argument 'file' cannot be empty. Received ''" and
+    // the model burns to max_tokens retrying the same empty call.
+    // Previously the `json_schema` body grammar combined with
+    // `enforce_min_length_on_required_strings` (`grammar/schema.rs`)
+    // enforced min_length 1 at the FSM level; lifting that check to
+    // the validator post-parse keeps the same invariant while letting
+    // the grammar body be `any_text` (native XML wire format).
+    const SHELL_FAMILY: &[&str] = &[
+        "bash", "Bash", "shell", "Shell", "exec", "Exec", "run", "Run",
+        "execute", "Execute", "terminal", "Terminal",
+    ];
+    const CMD_KEYS: &[&str] = &["command", "cmd", "script", "code"];
+    if SHELL_FAMILY.contains(&name.as_str()) {
+        for key in CMD_KEYS {
+            if let Some(serde_json::Value::String(cmd)) = args.get(*key)
+                && cmd.trim().is_empty()
+            {
+                return Err(format!(
+                    "Error: {name} requires a non-empty '{key}'. \
+                         Got empty string — provide the shell command \
+                         to execute, e.g. 'ls /tmp'."
+                ));
+            }
+        }
+    }
     if FILE_TOOLS.contains(&name.as_str()) {
         for key in PATH_KEYS {
             if let Some(serde_json::Value::String(path)) = args.get(*key) {
