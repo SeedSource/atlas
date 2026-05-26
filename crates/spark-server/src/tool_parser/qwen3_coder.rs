@@ -14,6 +14,21 @@ impl ToolCallParser for Qwen3CoderParser {
         "qwen3_coder"
     }
 
+    /// Tier-0 typed-args (2026-05-25 evening): qwen3_coder's XML wire
+    /// format keeps every `<parameter=KEY>VALUE</parameter>` body as a
+    /// raw string (see `parse_single_b.rs:118-123`). When the tool
+    /// schema declares a parameter as `integer`/`number`/`boolean`,
+    /// opencode rejects the string with `SchemaError(Expected number,
+    /// got "30")` and the model burns the turn retrying. Apply the
+    /// same schema-driven coercion the qwen3_xml parser uses
+    /// (`tool_parser/type_coerce.rs::coerce_all`) so e.g. the bash
+    /// tool's `timeout` field gets converted from "30" → 30 before
+    /// the call hits opencode. Coercion is conservative: never drops
+    /// fields, never panics, leaves unparseable values as-is.
+    fn wants_typed_arguments(&self) -> bool {
+        true
+    }
+
     fn compile_tool_grammar(
         &self,
         engine: &mut GrammarEngine,

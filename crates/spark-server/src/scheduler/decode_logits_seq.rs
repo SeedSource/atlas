@@ -304,8 +304,18 @@ pub fn process_seq_logits(
     // accounting as a sampled token — `decode_logits_step` pushes it to
     // `output_tokens`, calls `gs.accept_token`, runs stop-token / EOS /
     // streaming handling — so all downstream state is identical.
+    // Tier-1 (Epoch 1+2) gate: do NOT use the forced-token fast-path
+    // when we're inside a parameter body that has emitted zero content
+    // tokens — the fast-path returns the grammar's sole legal token
+    // directly without applying logit_bias, which bypasses our
+    // anti-empty-parameter mask on token 510 (`</`). Per
+    // `bench/fp8_dgx2_drift/research_synthesis.md`, this is exactly
+    // the over-restrictive fastpath case A7 flagged at
+    // `decode_logits_seq.rs:307-317`.
+    let tier1_active = a.inside_parameter_body && a.param_body_chars_emitted == 0;
     if !a.inside_thinking
         && a.top_logprobs.is_none()
+        && !tier1_active
         && crate::scheduler::helpers::forced_token_fastpath_enabled()
         && let Some(ref mut gs) = a.grammar_state
         && let Some(forced) = gs.forced_token()
@@ -393,6 +403,41 @@ pub fn process_seq_logits(
     // body (free text + `<think>`) the full preset
     // applies: this is where prose loops actually live.
     let in_tool = a.inside_tool_body && !a.inside_thinking;
+
+    // Tier-1 (Epoch 1+2) parameter-body byte-counter mask: when the
+    // model is inside `<parameter=KEY>…</parameter>` body AND no
+    // CONTENT tokens have been emitted yet, suppress (a) token 510
+    // (`</`, first token of `</parameter>` close), AND (b) the common
+    // whitespace-only tokens 220 (` `), 198 (`\n`), 197 (`\t`), 256
+    // (`  `), 271 (`\n\n`). The Epoch-2 v54 trial showed the model
+    // bypassed the close-only mask by emitting a whitespace token
+    // first (which the parser's `.trim()` strips at
+    // `tool_parser/parse_single_b.rs:105`, yielding empty args after
+    // the model "successfully" emits `</parameter>` on the next
+    // token). Masking the common whitespace cluster forces the first
+    // body token to be non-whitespace content.
+    //
+    // The Qwen3.6 vocab has many multi-byte whitespace tokens beyond
+    // these 5, so this is not bulletproof — but it covers the
+    // empirically-most-likely tokens the sampler picks in low-margin
+    // distributions under FP8 drift. A future Tier 1b would do a
+    // full vocab scan for whitespace-only tokens at boot.
+    //
+    // Bias of -8.0 is firm but not infinite — if the model has VERY
+    // strong evidence (which it shouldn't given the structural
+    // intent), the close can still win. State tracking lives in
+    // `emit_step.rs` flag-flip block.
+    let mut logit_bias_local = a.logit_bias.clone();
+    if a.inside_parameter_body && a.param_body_chars_emitted == 0 {
+        // Close-tag opener `</`
+        logit_bias_local.push((510u32, -8.0f32));
+        // Common whitespace tokens
+        logit_bias_local.push((220u32, -8.0f32)); // ` `
+        logit_bias_local.push((198u32, -8.0f32)); // `\n`
+        logit_bias_local.push((197u32, -8.0f32)); // `\t`
+        logit_bias_local.push((256u32, -8.0f32)); // `  `
+        logit_bias_local.push((271u32, -8.0f32)); // `\n\n`
+    }
     let sampled = sample_with_params_history(
         f32_bytes,
         &SamplingParams {
@@ -401,7 +446,7 @@ pub fn process_seq_logits(
             top_p: a.top_p,
             top_n_sigma: a.top_n_sigma,
             min_p: a.min_p,
-            logit_bias: a.logit_bias.clone(),
+            logit_bias: logit_bias_local,
             repetition_penalty: if in_tool { 1.0 } else { a.repetition_penalty },
             repetition_penalty_window: a.repetition_penalty_window,
             presence_penalty: if in_tool { 0.0 } else { a.presence_penalty },

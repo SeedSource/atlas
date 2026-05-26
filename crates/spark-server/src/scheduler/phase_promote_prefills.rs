@@ -169,6 +169,8 @@ fn build_active_seq_from_prefill(
         tool_call_opened: false,
         inside_tool_body: false,
         tool_body_streak_tokens: 0,
+        inside_parameter_body: false,
+        param_body_chars_emitted: 0,
         suppress_tool_call: p.suppress_tool_call,
         disable_mtp: p.disable_mtp,
         content_started: false,

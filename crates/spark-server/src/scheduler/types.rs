@@ -186,6 +186,22 @@ pub(super) struct ActiveSeq {
     /// while bounding worst-case wasted decode at ~15s @ 65 tok/s.
     /// Resets to 0 on tool_call_end emission.
     pub tool_body_streak_tokens: u32,
+    /// Tier-1 (Epoch 1) sampler byte counter: True between the model
+    /// emitting `<parameter=KEY>` and the matching `</parameter>` close.
+    /// While true AND `param_body_chars_emitted == 0`, decode_logits_seq.rs
+    /// masks token id 510 (`</`, first token of `</parameter>`) with bias
+    /// -8.0 so the model is forced to emit at least one non-close token
+    /// before the close-tag's first byte can be sampled. Defends against
+    /// xgrammar's failure to enforce `minLength: 1` on json_schema body
+    /// (3 grammar attempts so far — regex `\S` sandwich, regex `+`
+    /// quantifier, json_schema style qwen_xml with minLength:1 — none
+    /// enforce due to upstream xgrammar ε-edge bugs documented in
+    /// `bench/fp8_dgx2_drift/research_synthesis.md`).
+    pub inside_parameter_body: bool,
+    /// Tier-1 byte counter — number of tokens emitted INSIDE
+    /// `<parameter=KEY>…</parameter>` body so far. Reset to 0 on opener.
+    /// Increments by 1 per token while inside; used as the mask-gate.
+    pub param_body_chars_emitted: u32,
     /// When true, `<tool_call>` token logit is set to -inf during decode.
     pub suppress_tool_call: bool,
     /// F60 (2026-04-27): when true, MTP speculative decoding is bypassed.

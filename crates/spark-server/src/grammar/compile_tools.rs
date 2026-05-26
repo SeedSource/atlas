@@ -210,27 +210,56 @@ impl GrammarEngine {
         for st in &sanitized_tools {
             let begin = format!("<tool_call>\n<function={}>\n", st.name);
             let end = "\n</function>\n</tool_call>";
-            // Body content type: `any_text` — the qwen3_coder wire format is
-            // XML (`<parameter=KEY>VALUE</parameter>`), not JSON. Previous
-            // revisions used `json_schema` which forced the FSM to expect
-            // JSON-string state at every byte boundary, masking valid BPE
-            // tokens that decoded to `<parameter=` and collapsing the path
-            // into delimiter cascades like `"filePath":"]}]}]}}}` plus
-            // interior byte loss (`axum-v42` → `axu-v4`). `any_text` keeps
-            // the OUTER `<tool_call>…</tool_call>` framing constrained
-            // (begin/end above) while leaving the body unconstrained, so the
-            // native XML `<parameter=>` blocks are emitted intact. Schema
-            // validation remains: `validate_single_tool_call` +
-            // `backfill_required_params` run host-side after `parse_one_call`
-            // (see `tool_parser.rs` and `tool_handlers.rs:46`), catching
-            // any actual schema violations. Mirrors MiniMax's grammar at
-            // `compile_minimax_xml_tool_grammar` line 472 which uses the
-            // same `any_text` body for its native-XML format.
-            let _ = &st.schema; // schema retained for fallback path below
+            // Tier-0 (Epoch 3, 2026-05-26): switch to RAW EBNF
+            // (`grammar` content type) for the qwen3_coder body.
+            // Previous attempts (regex `\S` Kleene-sandwich, regex `+`
+            // quantifier with `[^ \t\r\n<][^<]*`, json_schema style
+            // qwen_xml with minLength:1) ALL failed to enforce
+            // non-empty parameter values under live opencode load
+            // because xgrammar's regex-to-FSM lowering treats `*`/`+`
+            // as quantifier edges with ε-transitions — the sole `\S`
+            // anchor is skipped — and the json_schema converter has
+            // a separate ε-edge bug for `[^]{1,}` minLength.
+            //
+            // EBNF rule INLINING (per B5's analysis of llama.cpp's
+            // GBNF: rule body for `min,max` quantifiers is inlined
+            // verbatim into the parent rule at compile time, so no
+            // ε-transition can skip the first occurrence) is the
+            // correct primitive for structural non-empty. Writing
+            // the value rule as `first-char rest` where `first-char`
+            // is a SINGLE TERMINAL CLASS (no quantifier) forces the
+            // FSM to consume one matching byte before continuing.
+            //
+            // EBNF below:
+            // - root      = one or more <parameter=KEY>VALUE</parameter> blocks separated by \n
+            // - paramname = [a-zA-Z_] [a-zA-Z_0-9]*
+            // - value     = MUST start with non-WS non-`<` byte, then any non-`<` bytes
+            //
+            // Param-name regex covers all valid Qwen3-Coder param names.
+            // Value rule rejects empty AND whitespace-only AND
+            // `<`-starting values, which structurally eliminates the
+            // close-tag-as-first-body-token failure mode without
+            // requiring sampler-level intervention.
+            //
+            // Trade-off: parameter VALUES that legitimately start with
+            // `<` (rare — Rust generics `<T>` inside path strings, bash
+            // redirection `< input`) cannot match. Empirically opencode
+            // tool args almost never start with `<`.
+            let body_ebnf = r#"root ::= param ("\n" param)*
+param ::= "<parameter=" paramname ">" value "</parameter>"
+paramname ::= [a-zA-Z_] [a-zA-Z_0-9]*
+value ::= first_char rest
+first_char ::= [^ \t\r\n<]
+rest ::= [^<]*
+"#;
+            let _ = &st.schema;
             tag_entries.push(serde_json::json!({
                 "type": "tag",
                 "begin": begin,
-                "content": {"type": "any_text"},
+                "content": {
+                    "type": "grammar",
+                    "grammar": body_ebnf,
+                },
                 "end": end,
             }));
         }
@@ -301,6 +330,13 @@ impl GrammarEngine {
                      emitted at trace level by xgrammar.",
                     tool_names.join(", "),
                 );
+                let body_ebnf = r#"root ::= param ("\n" param)*
+param ::= "<parameter=" paramname ">" value "</parameter>"
+paramname ::= [a-zA-Z_] [a-zA-Z_0-9]*
+value ::= first_char rest
+first_char ::= [^ \t\r\n<]
+rest ::= [^<]*
+"#;
                 let tag_entries_fallback: Vec<serde_json::Value> = sanitized_tools
                     .iter()
                     .map(|st| {
@@ -308,7 +344,10 @@ impl GrammarEngine {
                         serde_json::json!({
                             "type": "tag",
                             "begin": format!("<tool_call>\n<function={}>\n", st.name),
-                            "content": {"type": "any_text"},
+                            "content": {
+                                "type": "grammar",
+                                "grammar": body_ebnf,
+                            },
                             "end": "\n</function>\n</tool_call>",
                         })
                     })

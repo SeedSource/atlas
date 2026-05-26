@@ -140,3 +140,48 @@ fn qwen3_coder_grammar_accepts_multi_xml_params() {
          Input: {multi_param:?}"
     );
 }
+
+/// Tier-0 non-empty enforcement (2026-05-25 evening): the qwen3_coder
+/// grammar's regex content type must REJECT a parameter body that is
+/// empty or whitespace-only. This is the Atlas-internal version of
+/// llama.cpp#20164's "empty-parameter under long context" failure mode.
+/// Without this, the model's in-tool sampler (which intentionally zeros
+/// rep/DRY/freq/presence penalties because XGrammar usually shapes the
+/// output) can pick `</parameter>` as its very next token after the
+/// opener — burning opencode tool-call turns on empty bash commands and
+/// empty file paths.
+#[test]
+fn qwen3_coder_grammar_rejects_empty_parameter_body() {
+    let vocab = test_vocab();
+    let stop_ids = vec![130i32];
+    let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
+    let tools = exec_tool_def();
+    let compiled = engine
+        .compile_qwen3_coder_tool_grammar(&tools, true)
+        .expect("compile must succeed");
+
+    let empty_body =
+        "<tool_call>\n<function=exec>\n<parameter=command></parameter>\n</function>\n</tool_call>";
+    assert!(
+        !grammar_accepts(&compiled, empty_body),
+        "empty parameter body must be REJECTED by Tier-0 regex. Input: {empty_body:?}"
+    );
+}
+
+#[test]
+fn qwen3_coder_grammar_rejects_whitespace_only_parameter_body() {
+    let vocab = test_vocab();
+    let stop_ids = vec![130i32];
+    let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
+    let tools = exec_tool_def();
+    let compiled = engine
+        .compile_qwen3_coder_tool_grammar(&tools, true)
+        .expect("compile must succeed");
+
+    let whitespace_body =
+        "<tool_call>\n<function=exec>\n<parameter=command>   \n  </parameter>\n</function>\n</tool_call>";
+    assert!(
+        !grammar_accepts(&compiled, whitespace_body),
+        "whitespace-only parameter body must be REJECTED. Input: {whitespace_body:?}"
+    );
+}

@@ -108,6 +108,8 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         } else if a.tool_call_end_token == Some(tok) {
             a.inside_tool_body = false;
             a.tool_body_streak_tokens = 0;
+            a.inside_parameter_body = false;
+            a.param_body_chars_emitted = 0;
         } else if a.inside_tool_body {
             a.tool_body_streak_tokens = a.tool_body_streak_tokens.saturating_add(1);
             if a.tool_body_streak_tokens > MAX_TOOL_BODY_TOKENS {
@@ -116,6 +118,94 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
                     "Stuck in tool body for {MAX_TOOL_BODY_TOKENS}+ tokens with no </tool_call>; ending response (model never closed the envelope — would otherwise burn to max_tokens). Sanitizer will salvage what it can."
                 );
                 a.finished = true;
+            }
+
+            // Tier-1 (Epoch 1) parameter-body state tracking. Token IDs
+            // for Qwen3.6 byte-level BPE tokenizer (verified live via
+            // /tokenize endpoint 2026-05-25):
+            //   `<`         = 27
+            //   `parameter` = 15704
+            //   `=`         = 28
+            //   `>`         = 29
+            //   `</`        = 510  ← masked while body is empty
+            // Opener `<parameter=KEY>` ends at `>` (29). The KEY span
+            // between `=` and `>` is variable (typically 1-3 tokens
+            // like `command`, `filePath`, `content`). To robustly
+            // detect the opener, look back through the last 8 tokens
+            // when `>` is emitted and check for the `<parameter=`
+            // signature [27, 15704, 28] without an intervening
+            // `</parameter>` close.
+            //
+            // Closer `</parameter>` starts at `</` (510). When emitted
+            // inside the body, clear the flag.
+            //
+            // While `inside_parameter_body && param_body_chars_emitted
+            // == 0`, decode_logits_seq.rs masks token 510 with bias
+            // -8.0 — forcing the model to emit at least one non-close
+            // token before the close-tag's first byte can be sampled.
+            const TOK_LT: u32 = 27;
+            const TOK_PARAMETER: u32 = 15704;
+            const TOK_EQ: u32 = 28;
+            const TOK_GT: u32 = 29;
+            const TOK_LT_SLASH: u32 = 510;
+            if a.inside_parameter_body {
+                if tok == TOK_LT_SLASH {
+                    // Start of `</parameter>` close-tag — exit body.
+                    a.inside_parameter_body = false;
+                    a.param_body_chars_emitted = 0;
+                } else {
+                    // Epoch-2 fix: don't count whitespace-only tokens
+                    // toward the chars counter (otherwise the model
+                    // can emit ` `/`\n`/etc to satisfy the gate while
+                    // the parser's `.trim()` strips it to empty).
+                    // Common Qwen3.6 whitespace tokens (verified via
+                    // /tokenize endpoint): 220, 198, 197, 256, 271.
+                    let is_whitespace_token = matches!(
+                        tok,
+                        220 | 198 | 197 | 256 | 271
+                    );
+                    if !is_whitespace_token {
+                        a.param_body_chars_emitted =
+                            a.param_body_chars_emitted.saturating_add(1);
+                    }
+                }
+            } else if tok == TOK_GT {
+                // Possible end of `<parameter=KEY>` opener. Look back
+                // through last 8 tokens for the [27, 15704, 28]
+                // signature WITHOUT an intervening 510 (`</`) or 29
+                // (`>` — would be a previous param close).
+                let n = a.output_tokens.len();
+                if n >= 4 {
+                    let start = n.saturating_sub(8);
+                    let window = &a.output_tokens[start..n];
+                    // Find the signature; skip if 510 appears between
+                    // the signature and the current `>` (would mean
+                    // the parameter already closed before this `>`).
+                    let mut sig_idx: Option<usize> = None;
+                    for i in 0..window.len().saturating_sub(2) {
+                        if window[i] == TOK_LT
+                            && window[i + 1] == TOK_PARAMETER
+                            && window[i + 2] == TOK_EQ
+                        {
+                            sig_idx = Some(i + 3);
+                        }
+                    }
+                    if let Some(after_eq) = sig_idx {
+                        // Check no 510 / 29 between after_eq and the
+                        // end of the window (the `>` is the LAST
+                        // emitted token, but it's already in
+                        // output_tokens at this point? Actually emit
+                        // happens here so check window[after_eq..]).
+                        let body_segment = &window[after_eq..];
+                        let intervening_close = body_segment.iter().any(|&t| {
+                            t == TOK_LT_SLASH || t == TOK_GT
+                        });
+                        if !intervening_close {
+                            a.inside_parameter_body = true;
+                            a.param_body_chars_emitted = 0;
+                        }
+                    }
+                }
             }
         }
     }
