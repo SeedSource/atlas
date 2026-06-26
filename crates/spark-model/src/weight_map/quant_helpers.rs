@@ -63,10 +63,20 @@ pub(crate) fn dequant_fp8_blockscaled_to_bf16(
         "FP8 size mismatch: total={total} byte_size={byte_size}"
     );
 
-    let s = store.get(&format!("{prefix}.weight_scale_inv"))?;
+    // Block scale key: DeepSeek/Qwen native FP8 ships `weight_scale_inv`;
+    // ModelOpt / compressed-tensors mixed-precision checkpoints (e.g.
+    // lovedheart AgentWorld-35B attention + SSM kept block-FP8 while the MoE
+    // is NVFP4) ship a 2D `weight_scale`. Both are the per-block dequant
+    // multiplier consumed identically by `dequant_fp8_blockscaled_bf16`.
+    let scale_key = if store.contains(&format!("{prefix}.weight_scale_inv")) {
+        format!("{prefix}.weight_scale_inv")
+    } else {
+        format!("{prefix}.weight_scale")
+    };
+    let s = store.get(&scale_key)?;
     ensure!(
         s.dtype == WeightDtype::BF16 || s.dtype == WeightDtype::FP32,
-        "Expected BF16 or FP32 for {prefix}.weight_scale_inv, got {:?}",
+        "Expected BF16 or FP32 for {scale_key}, got {:?}",
         s.dtype,
     );
     let sn = s.shape[0];
@@ -139,7 +149,17 @@ pub(crate) fn dense_auto(
             // linear_attn projections) ships a scalar `weight_scale`. Pick by
             // which one is present so MIXED_PRECISION loads instead of erroring
             // on the absent `weight_scale_inv` (issue #107).
-            if store.contains(&format!("{prefix}.weight_scale_inv")) {
+            // Block-scaled FP8 ships a 2D scale (Qwen/DeepSeek native:
+            // `weight_scale_inv`; ModelOpt mixed-precision: `weight_scale`).
+            // Per-tensor FP8 (nvidia MIXED_PRECISION) ships a *scalar*
+            // `weight_scale`. Take the block dequant whenever a 2D scale is
+            // present under either key, else fall to the scalar path.
+            let has_scale_inv = store.contains(&format!("{prefix}.weight_scale_inv"));
+            let scale_is_2d = store
+                .get(&format!("{prefix}.weight_scale"))
+                .map(|s| s.shape.len() == 2)
+                .unwrap_or(false);
+            if has_scale_inv || scale_is_2d {
                 dequant_fp8_blockscaled_to_bf16(store, prefix, gpu)
             } else {
                 dequant_fp8_to_bf16(store, prefix, gpu)
