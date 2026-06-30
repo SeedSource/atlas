@@ -15,6 +15,7 @@
 //!   - `gemma4`: Gemma-4 (pure attention, GeGLU, sliding + full attention)
 
 pub mod dflash_loader;
+pub mod dspark_loader;
 mod gemma4;
 mod minimax;
 mod nemotron;
@@ -27,6 +28,9 @@ mod step3p7;
 pub use dflash_loader::{
     DflashConfig, DflashLayerWeights, DflashSubConfig, DflashWeights, load_dflash_weights,
     store_has_dflash_weights,
+};
+pub use dspark_loader::{
+    DSparkConfig, DSparkLayerWeights, DSparkWeights, load_dspark_weights, store_has_dspark_weights,
 };
 pub use gemma4::Gemma4WeightLoader;
 pub use minimax::MinimaxM2WeightLoader;
