@@ -60,7 +60,7 @@ impl Qwen3AttentionLayer {
                 // kernel never over-reads (num_tokens must be a whole number of
                 // chunk_len-length sequences).
                 anyhow::ensure!(
-                    mb.chunk_len > 0 && num_tokens % (mb.chunk_len as usize) == 0,
+                    mb.chunk_len > 0 && num_tokens.is_multiple_of(mb.chunk_len as usize),
                     "batched flash: num_tokens {num_tokens} not a multiple of chunk_len {}",
                     mb.chunk_len
                 );

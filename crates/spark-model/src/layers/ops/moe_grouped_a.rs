@@ -350,7 +350,7 @@ pub fn moe_permute_tokens(
     total_expanded: u32,
     stream: u64,
 ) -> Result<()> {
-    let threads = hidden.min(256).max(1);
+    let threads = hidden.clamp(1, 256);
     KernelLaunch::new(gpu, kernel)
         .grid([total_expanded, 1, 1])
         .block([threads, 1, 1])

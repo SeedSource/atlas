@@ -28,6 +28,9 @@ impl MoeLayer {
     /// `t0` carries the running profile timer so per-step timing output
     /// matches the original inline pipeline exactly.
     #[allow(clippy::too_many_arguments)]
+    // sfb Options are guarded by `.is_some()` in the enclosing `if`; `.expect`
+    // after that is intentional (can't if-let-bind inside the `&&` guard chain).
+    #[allow(clippy::unnecessary_unwrap)]
     pub(super) fn run_routed_grouped_gemm(
         &self,
         expert_input: DevicePtr,
