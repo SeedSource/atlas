@@ -395,7 +395,11 @@ fn gpu_dequant_fp8_pertensor(
 /// Read a per-tensor FP8 `weight_scale` scalar (FP32 or BF16 — RedHatAI re-quants
 /// ship BF16) from the store as `f32`. Shared host fallback for the per-tensor
 /// dequant paths below.
-fn read_scalar_weight_scale(store: &WeightStore, prefix: &str, gpu: &dyn GpuBackend) -> Result<f32> {
+fn read_scalar_weight_scale(
+    store: &WeightStore,
+    prefix: &str,
+    gpu: &dyn GpuBackend,
+) -> Result<f32> {
     let scale_key = format!("{prefix}.weight_scale");
     let s = store.get(&scale_key)?;
     ensure!(

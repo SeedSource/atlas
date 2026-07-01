@@ -22,6 +22,11 @@ extend-ignore-identifiers-re = [
     # `BA_GEMM` — A+B linear-attention GEMM in the design docs. Not a
     # typo of `BY`/`BE`.
     "BA_GEMM",
+    # `ue4m3` — CUTLASS unsigned-E4M3 FP8 scale format (UE4M3). Appears in
+    # compound kernel identifiers like `mt_float_to_ue4m3` / `mt_ue4m3_to_float`
+    # in the fp4_mma microtests; typos splits these and flags the bare `ue`.
+    # The exact-identifier entry below doesn't cover the compounds. Not a typo.
+    ".*ue4m3.*",
 ]
 
 [default.extend-words]
