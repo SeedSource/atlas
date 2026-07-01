@@ -575,6 +575,7 @@ impl Qwen3AttentionLayer {
                 num_tokens,
                 kv_write_start,
                 kv_cache,
+                None, // batched_meta: single-stream (seq_len_start == 0)
                 ctx,
                 stream,
             )?
