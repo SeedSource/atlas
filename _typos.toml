@@ -82,6 +82,9 @@ unparseable = "unparseable"
 wht_bf16 = "wht_bf16"
 wht_dim = "wht_dim"
 wht_stride = "wht_stride"
+# CUTLASS FP8 unsigned-E4M3 scale-factor type (float_ue4m3_t) — "ue" is not a typo.
+float_ue4m3_t = "float_ue4m3_t"
+ue4m3 = "ue4m3"
 
 [files]
 extend-exclude = [

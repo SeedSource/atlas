@@ -203,6 +203,7 @@ pub trait GpuBackend: Send + Sync {
     /// `dst_pitch`. Default = per-row `copy_d2d_async` loop; the CUDA backend
     /// overrides with ONE `cudaMemcpy2DAsync` (replaces the per-token Z-copy
     /// loop = up to num_tokens×num_ssm_layers launches/forward).
+    #[allow(clippy::too_many_arguments)]
     fn copy_d2d_2d_async(
         &self,
         src: DevicePtr,

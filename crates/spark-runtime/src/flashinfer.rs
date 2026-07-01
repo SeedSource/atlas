@@ -283,6 +283,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a free CUDA device + FLASHINFER_HOME build"]
+    #[allow(clippy::needless_range_loop)] // numerical reference: index-parallel loops read clearest
     fn flashinfer_ragged_prefill_matches_cpu_reference() {
         // 2 ragged requests (6 + 10 tokens), GQA 4 qo / 2 kv heads, hd=256, causal.
         const HD: usize = 256;
@@ -403,7 +404,7 @@ mod tests {
                         dot += g * r;
                         na += g * g;
                         nb += r * r;
-                        max_rel = max_rel.max((g - r).abs() / (r.abs() + 1e-3) as f64);
+                        max_rel = max_rel.max((g - r).abs() / (r.abs() + 1e-3));
                     }
                     let cos = dot / (na.sqrt() * nb.sqrt() + 1e-12);
                     worst_cos = worst_cos.min(cos);

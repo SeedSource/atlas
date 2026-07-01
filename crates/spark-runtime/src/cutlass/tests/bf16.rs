@@ -3,7 +3,6 @@
 
 use super::super::*;
 use super::*;
-use std::ffi::c_void;
 
 #[test]
 #[ignore = "requires a free CUDA device and CUTLASS_HOME build"]

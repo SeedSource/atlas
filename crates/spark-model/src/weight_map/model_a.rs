@@ -392,6 +392,32 @@ fn gpu_dequant_fp8_pertensor(
     Ok(())
 }
 
+/// Read a per-tensor FP8 `weight_scale` scalar (FP32 or BF16 — RedHatAI re-quants
+/// ship BF16) from the store as `f32`. Shared host fallback for the per-tensor
+/// dequant paths below.
+fn read_scalar_weight_scale(store: &WeightStore, prefix: &str, gpu: &dyn GpuBackend) -> Result<f32> {
+    let scale_key = format!("{prefix}.weight_scale");
+    let s = store.get(&scale_key)?;
+    ensure!(
+        s.num_elements() == 1,
+        "Expected scalar for {scale_key}, got {} elements",
+        s.num_elements()
+    );
+    match s.dtype {
+        WeightDtype::FP32 => {
+            let mut buf = [0u8; 4];
+            gpu.copy_d2h(s.ptr, &mut buf)?;
+            Ok(f32::from_le_bytes(buf))
+        }
+        WeightDtype::BF16 => {
+            let mut buf = [0u8; 2];
+            gpu.copy_d2h(s.ptr, &mut buf)?;
+            Ok(bf16_bytes_to_f32(buf))
+        }
+        other => bail!("Expected FP32 or BF16 for {scale_key}, got {:?}", other),
+    }
+}
+
 /// Dequantize FP8 E4M3 + per-tensor scale → BF16, returning a DenseWeight.
 ///
 /// Allocates a new GPU buffer for the result. Use `dequant_fp8_to_bf16_into` to
@@ -420,32 +446,8 @@ pub(crate) fn dequant_fp8_to_bf16(
         let mut fp8_buf = vec![0u8; n_bytes];
         gpu.copy_d2h(w.ptr, &mut fp8_buf)?;
 
-        // RedHatAI re-quant checkpoints store per-tensor scale as BF16,
-        // not FP32. Handle both dtypes.
-        let scale_key = format!("{prefix}.weight_scale");
-        let s = store.get(&scale_key)?;
-        let scale = if s.dtype == WeightDtype::FP32 {
-            ensure!(
-                s.num_elements() == 1,
-                "Expected scalar for {scale_key}, got {} elements",
-                s.num_elements()
-            );
-            let mut buf = [0u8; 4];
-            gpu.copy_d2h(s.ptr, &mut buf)?;
-            f32::from_le_bytes(buf)
-        } else if s.dtype == WeightDtype::BF16 {
-            ensure!(
-                s.num_elements() == 1,
-                "Expected scalar for {scale_key}, got {} elements",
-                s.num_elements()
-            );
-            let mut buf = [0u8; 2];
-            gpu.copy_d2h(s.ptr, &mut buf)?;
-            bf16_bytes_to_f32(buf)
-        } else {
-            bail!("Expected FP32 or BF16 for {scale_key}, got {:?}", s.dtype);
-        };
-
+        // RedHatAI re-quant checkpoints store per-tensor scale as BF16, not FP32.
+        let scale = read_scalar_weight_scale(store, prefix, gpu)?;
         let bf16_buf = dequant_fp8_bytes_to_bf16(&fp8_buf, scale);
         let ptr = gpu.alloc(bf16_buf.len())?;
         gpu.copy_h2d(&bf16_buf, ptr)?;
@@ -477,30 +479,7 @@ pub(crate) fn dequant_fp8_to_bf16_into(
         let mut fp8_buf = vec![0u8; n_bytes];
         gpu.copy_d2h(w.ptr, &mut fp8_buf)?;
 
-        let scale_key = format!("{prefix}.weight_scale");
-        let s = store.get(&scale_key)?;
-        let scale = if s.dtype == WeightDtype::FP32 {
-            ensure!(
-                s.num_elements() == 1,
-                "Expected scalar for {scale_key}, got {} elements",
-                s.num_elements()
-            );
-            let mut buf = [0u8; 4];
-            gpu.copy_d2h(s.ptr, &mut buf)?;
-            f32::from_le_bytes(buf)
-        } else if s.dtype == WeightDtype::BF16 {
-            ensure!(
-                s.num_elements() == 1,
-                "Expected scalar for {scale_key}, got {} elements",
-                s.num_elements()
-            );
-            let mut buf = [0u8; 2];
-            gpu.copy_d2h(s.ptr, &mut buf)?;
-            bf16_bytes_to_f32(buf)
-        } else {
-            bail!("Expected FP32 or BF16 for {scale_key}, got {:?}", s.dtype);
-        };
-
+        let scale = read_scalar_weight_scale(store, prefix, gpu)?;
         let bf16_buf = dequant_fp8_bytes_to_bf16(&fp8_buf, scale);
         gpu.copy_h2d(&bf16_buf, dest)?;
     }
