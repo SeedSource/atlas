@@ -176,6 +176,25 @@ pub fn parse_deepseek_v4(json: &str) -> Result<ModelConfig> {
         config.mtp_num_hidden_layers = n as usize;
     }
 
+    // Native DSpark drafter (deepseek-ai/DeepSeek-V4-Flash-DSpark). These live at
+    // the top level of the DSpark config.json and are absent on the NVIDIA-style
+    // MTP checkpoint; each defaults to 0/empty when missing.
+    if let Some(v) = raw.get("dspark_block_size").and_then(|v| v.as_u64()) {
+        config.dspark_block_size = v as usize;
+    }
+    if let Some(v) = raw.get("dspark_markov_rank").and_then(|v| v.as_u64()) {
+        config.dspark_markov_rank = v as usize;
+    }
+    if let Some(v) = raw.get("dspark_noise_token_id").and_then(|v| v.as_u64()) {
+        config.dspark_noise_token_id = v as u32;
+    }
+    if let Some(ids) = raw.get("dspark_target_layer_ids").and_then(|v| v.as_array()) {
+        config.dspark_target_layer_ids = ids
+            .iter()
+            .filter_map(|v| v.as_u64().map(|x| x as usize))
+            .collect();
+    }
+
     // Parse quantization_config if present
     if config.quantization_config.is_none() {
         config.quantization_config = parse_quantization_config(&raw);
@@ -371,5 +390,74 @@ mod mscale_contract_tests {
             qwen.yarn_mscale, 1.0,
             "shared factory default must remain 1.0 for non-DS4F models"
         );
+    }
+}
+
+#[cfg(test)]
+mod dspark_config_tests {
+    use super::*;
+
+    // Real DeepSeek-V4-Flash-DSpark config.json top-level DSpark fields, layered
+    // onto a minimal-but-parseable DeepSeek-V4 config body.
+    const DSPARK_CONFIG: &str = r#"{
+      "architectures": ["DeepseekV4ForCausalLM"],
+      "head_dim": 512,
+      "hidden_size": 4096,
+      "max_position_embeddings": 1048576,
+      "model_type": "deepseek_v4",
+      "num_attention_heads": 64,
+      "num_hidden_layers": 43,
+      "num_key_value_heads": 1,
+      "o_lora_rank": 1024,
+      "q_lora_rank": 1024,
+      "qk_rope_head_dim": 64,
+      "rms_norm_eps": 1e-06,
+      "rope_scaling": {
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "factor": 16,
+        "original_max_position_embeddings": 65536,
+        "type": "yarn"
+      },
+      "rope_theta": 10000,
+      "vocab_size": 129280,
+      "num_nextn_predict_layers": 1,
+      "dspark_block_size": 5,
+      "dspark_markov_rank": 256,
+      "dspark_noise_token_id": 128799,
+      "dspark_target_layer_ids": [40, 41, 42]
+    }"#;
+
+    // The native DSpark drafter fields parse to the checkpoint's known values.
+    #[test]
+    fn parse_dspark_config_reads_native_fields() {
+        let c = parse_deepseek_v4(DSPARK_CONFIG).expect("parse DSpark config");
+        assert_eq!(c.dspark_block_size, 5, "dspark_block_size");
+        assert_eq!(c.dspark_markov_rank, 256, "dspark_markov_rank");
+        assert_eq!(c.dspark_noise_token_id, 128799, "dspark_noise_token_id");
+        assert_eq!(
+            c.dspark_target_layer_ids,
+            vec![40, 41, 42],
+            "dspark_target_layer_ids"
+        );
+        // num_nextn_predict_layers=1 => the loader's MTP gate is enabled.
+        assert_eq!(c.num_mtp_modules, 1, "num_mtp_modules from num_nextn_predict");
+    }
+
+    // A config WITHOUT the DSpark fields (e.g. the NVIDIA-style MTP checkpoint)
+    // leaves them at the "unused" defaults — no false-positive native detection.
+    #[test]
+    fn absent_dspark_fields_default_to_unused() {
+        let no_dspark = DSPARK_CONFIG
+            .replace("\"num_nextn_predict_layers\": 1,", "")
+            .replace("\"dspark_block_size\": 5,", "")
+            .replace("\"dspark_markov_rank\": 256,", "")
+            .replace("\"dspark_noise_token_id\": 128799,", "")
+            .replace("\"dspark_target_layer_ids\": [40, 41, 42]", "\"tie_word_embeddings\": false");
+        let c = parse_deepseek_v4(&no_dspark).expect("parse non-DSpark config");
+        assert_eq!(c.dspark_block_size, 0);
+        assert_eq!(c.dspark_markov_rank, 0);
+        assert_eq!(c.dspark_noise_token_id, 0);
+        assert!(c.dspark_target_layer_ids.is_empty());
     }
 }
