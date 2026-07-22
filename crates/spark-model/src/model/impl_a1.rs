@@ -330,6 +330,14 @@ impl TransformerModel {
             Some(gpu.alloc(dflash_hidden_save_rows * n * config.hidden_size * 2)?)
         };
 
+        // Native DSpark hidden-stack capture (mean over the `hc_mult` mHC streams
+        // of the post-layer residual = native `main_hidden`). Optional: only
+        // DeepSeek-V4 mHC builds ship the `hc_stream_mean` kernel; `KernelHandle(0)`
+        // otherwise. The DFlash capture only uses it on the gated native-DSpark path
+        // (`dspark_block_size > 0 && hc_mult > 0`), so non-DSpark DFlash is unaffected.
+        let hc_stream_mean_k =
+            crate::layers::try_kernel(gpu.as_ref(), "hyper_connection", "hc_stream_mean");
+
         // EP command buffer for token broadcast (4 bytes, u32)
         let ep_cmd_buf = gpu.alloc(4)?;
 
@@ -576,6 +584,7 @@ impl TransformerModel {
             dflash_hidden_save,
             dflash_hidden_save_rows,
             dflash_capture_layers,
+            hc_stream_mean_k,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),
             verify4_graph: Mutex::new(std::collections::HashMap::new()),

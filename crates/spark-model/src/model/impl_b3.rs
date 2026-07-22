@@ -429,11 +429,42 @@ impl TransformerModel {
         };
         let h = self.config.hidden_size;
         let bf16 = 2usize;
-        // The residual stream is always BF16, so DFlash hidden capture
-        // copies BF16 bytes directly with no downcast.
-        let src = self.buffers.hidden_states().offset(token_idx * h * bf16);
         let dst_slot = dst.offset(slot * h * bf16);
-        self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
+        // Native DSpark drafter consumes `main_hidden` = the MEAN over the
+        // `hc_mult` mHC streams of the layer's POST-layer residual (native
+        // `h.mean(dim=stream)` / vLLM `hidden_states.mean(dim=1)`). That value
+        // lives in the FP32 `hc_streams` highway [M, hc_mult, H], written by the
+        // layer's terminating `hc_post`; it is NOT the single-stream
+        // `hidden_states` scratch (the FFN `hc_pre` gated collapse). Reduce
+        // hc_streams -> BF16 hidden for the native-DSpark path only. Gated on
+        // `dspark_block_size > 0 && hc_mult > 0` so ordinary DFlash capture
+        // (Qwen etc., no mHC) keeps its byte-identical `hidden_states` copy.
+        // Pure read of `hc_streams` + write to the separate capture buffer — the
+        // target forward's live buffers are never mutated.
+        if self.config.dspark_block_size > 0
+            && self.config.hc_mult > 0
+            && self.hc_stream_mean_k.0 != 0
+        {
+            let hc = self.config.hc_mult;
+            let fp32 = 4usize;
+            // hc_streams is FP32 [M, hc_mult, H], stream-major per token.
+            let src = self.buffers.hc_streams().offset(token_idx * hc * h * fp32);
+            ops::hc_stream_mean(
+                self.gpu.as_ref(),
+                self.hc_stream_mean_k,
+                src,
+                dst_slot,
+                1,
+                h as u32,
+                hc as u32,
+                stream,
+            )?;
+        } else {
+            // The residual stream is always BF16, so DFlash hidden capture
+            // copies BF16 bytes directly with no downcast.
+            let src = self.buffers.hidden_states().offset(token_idx * h * bf16);
+            self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
+        }
         Ok(())
     }
 
