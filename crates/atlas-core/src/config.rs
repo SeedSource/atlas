@@ -375,6 +375,21 @@ pub struct ModelConfig {
     /// layer = 3 future-token predictors).
     #[serde(default)]
     pub mtp_transformer_layers: usize,
+    /// Native DSpark drafter block size (`dspark_block_size`): the semi-AR draft
+    /// block length. 0 = not a native DSpark checkpoint.
+    #[serde(default)]
+    pub dspark_block_size: usize,
+    /// Native DSpark serial-Markov-head rank (`dspark_markov_rank`). 0 = unused.
+    #[serde(default)]
+    pub dspark_markov_rank: usize,
+    /// Native DSpark noise/placeholder token id (`dspark_noise_token_id`) used to
+    /// pad the drafted block. 0 = unused.
+    #[serde(default)]
+    pub dspark_noise_token_id: u32,
+    /// Native DSpark target layer ids whose hidden states feed the drafter
+    /// (`dspark_target_layer_ids`, e.g. `[40, 41, 42]`). Empty = unused.
+    #[serde(default)]
+    pub dspark_target_layer_ids: Vec<usize>,
     /// Explicit rotary dimension from config (bypasses partial_rotary_factor
     /// computation). MiniMax M2 ships `rotary_dim: 64` while head_dim=128,
     /// so the rotary factor is 0.5 — we honor the explicit int value when

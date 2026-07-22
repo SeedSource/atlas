@@ -107,6 +107,11 @@ impl ModelConfig {
             qk_norm_type: String::new(),
             num_mtp_modules: 0,
             mtp_transformer_layers: 0,
+            // Native DSpark drafter fields — default "unused" (0/empty).
+            dspark_block_size: 0,
+            dspark_markov_rank: 0,
+            dspark_noise_token_id: 0,
+            dspark_target_layer_ids: Vec::new(),
             rotary_dim: 0,
             dflash_capture_layers: Vec::new(),
             adapter_max_rank: 0,

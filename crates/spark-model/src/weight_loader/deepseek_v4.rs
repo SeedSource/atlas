@@ -9,9 +9,16 @@ mod assemble;
 mod attn_sink;
 mod compute;
 mod csa_ape;
+// Native DSpark drafter loader for deepseek-ai/DeepSeek-V4-Flash-DSpark.
+mod dspark;
 mod load_layers;
 // MTP draft-module loader for nvidia/DeepSeek-V4-Flash-NVFP4.
 mod mtp;
+// Re-exported for the (forthcoming) native-DSpark K=1 proposer (Commit 2); not
+// yet consumed on this loader-only commit, so silence the unused-import lint
+// under `#![deny(warnings)]`.
+#[allow(unused_imports)]
+pub(crate) use dspark::{DeepseekV4DSparkModule, load_v4_dspark_module};
 pub(crate) use mtp::{DeepseekV4MtpModule, load_v4_mtp_module};
 
 use anyhow::{Context, Result};
