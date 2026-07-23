@@ -194,6 +194,14 @@ pub fn parse_deepseek_v4(json: &str) -> Result<ModelConfig> {
             .filter_map(|v| v.as_u64().map(|x| x as usize))
             .collect();
     }
+    // The drafter sliding-window depth lives at the DSpark config top level as
+    // `window_size` (e.g. 128). Only meaningful on a native DSpark checkpoint,
+    // so gate on `dspark_block_size` to avoid capturing an unrelated key.
+    if config.dspark_block_size > 0
+        && let Some(v) = raw.get("window_size").and_then(|v| v.as_u64())
+    {
+        config.dspark_window_size = v as usize;
+    }
 
     // Parse quantization_config if present
     if config.quantization_config.is_none() {
@@ -425,7 +433,8 @@ mod dspark_config_tests {
       "dspark_block_size": 5,
       "dspark_markov_rank": 256,
       "dspark_noise_token_id": 128799,
-      "dspark_target_layer_ids": [40, 41, 42]
+      "dspark_target_layer_ids": [40, 41, 42],
+      "window_size": 128
     }"#;
 
     // The native DSpark drafter fields parse to the checkpoint's known values.
@@ -440,6 +449,9 @@ mod dspark_config_tests {
             vec![40, 41, 42],
             "dspark_target_layer_ids"
         );
+        // Drafter sliding-window ring depth (main_kv_cache) parses from
+        // `window_size` (gated on dspark_block_size > 0).
+        assert_eq!(c.dspark_window_size, 128, "dspark_window_size");
         // num_nextn_predict_layers=1 => the loader's MTP gate is enabled.
         assert_eq!(c.num_mtp_modules, 1, "num_mtp_modules from num_nextn_predict");
     }

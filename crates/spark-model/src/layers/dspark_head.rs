@@ -10,62 +10,143 @@
 //! topped by the DSpark heads (`main_proj`/`main_norm` block-input projection,
 //! final norm, serial Markov token head, confidence head).
 //!
-//! ## Commit 3 scaffold (this file)
+//! ## Commit 4 (this file) — sliding-window main-KV + block-input projection
 //!
-//! This commit lands the proposer's **structure + lifecycle + production
-//! install** only. The numerical forward — the real block/Markov/confidence
-//! math — is deferred to the gated Commit 4. Concretely:
+//! Commit 3 landed the lifecycle scaffold with a shared [`PagedKvCache`] and an
+//! empty `propose()`. Commit 4 makes the two structural corrections the Gate-3
+//! audit named, and advances `propose()` as far as Atlas's existing kernels
+//! allow:
 //!
-//!   * `new()` / `alloc_state` / `after_verify` / `free_state` are REAL: the
-//!     proposer owns its per-sequence state and its own KV cache(s), mirroring
-//!     [`crate::layers::DeepseekV4MtpHead`].
-//!   * `propose()` is an explicit SCAFFOLD: it validates state shape, logs, and
-//!     returns `Ok(Vec::new())` (drafts nothing). No target hidden / stage
-//!     forward runs yet.
-//!   * `last_confidence()` returns `None` until the confidence head is wired.
+//! 1. **Sliding-window `main_kv_cache` ring buffer** (Gate-3 "biggest
+//!    correction"). The scaffold's paged KV is replaced by Mia's per-stage
+//!    sliding-window ring buffer ([`DsparkMainKvCache`], `dspark.py:282-292`):
+//!    `[max_seqs, window, head_dim]`, absolute main-token position `p` → ring
+//!    slot `p % window` (`dspark.py:421`), `valid_len = seg_len - rejected`
+//!    catch-up on reject (`dspark.py:385/442`). The ring index contract is pure
+//!    host math ([`ring_slot`] / [`ring_valid_len`]) and CPU-unit-tested; the
+//!    device buffers are process-lifetime on the head (one per stage), the
+//!    per-sequence write position lives on the state.
+//!
+//! 2. **`propose()` = Mia `draft()` call order** (`dspark.py:868-995`). The
+//!    block-input projection [`DeepseekV4DSparkHead::project_main`] (Mia
+//!    `project_main`, `dspark.py:708-711`: `main_proj` then `main_norm` over the
+//!    `[40,41,42]` target-hidden stack) is implemented with the existing
+//!    `dense_gemv` + `rms_norm` kernels and exercised by `propose()` — it is the
+//!    `main_proj_out` / `main_norm_out` golden boundaries. The remaining
+//!    semi-AR block forward (noise block → embed → hc_expand → 3× sparse-MLA
+//!    stage `forward_dspark` → hc_head → base logits → serial-Markov argmax loop
+//!    → confidence → emit pos-0) is a **net-new drafter kernel surface** — see
+//!    the STOP note in `propose()` — and does not reuse the target's per-token
+//!    MLA decode. It converges on GPU once those kernels land in the image
+//!    build.
 //!
 //! Externally the proposer exposes only **K=1** (`num_drafts > 1` is warned and
-//! ignored); the semi-AR block width is an internal detail of the deferred
-//! forward.
-//!
-//! ## KV cache sizing (scaffold decision)
-//!
-//! The 3 stage bodies were each assembled with `attn_layer_idx =
-//! num_hidden_layers` (interior / no-compressor path), exactly as
-//! [`crate::layers::DeepseekV4MtpHead`] builds its single stage. So — like the
-//! MTP head — the KV cache pool must have `num_hidden_layers + 1` layer slots
-//! for that index to be valid. A single shared [`PagedKvCache`] is allocated
-//! with that layer count and blocks scaled by the stage count, and the
-//! per-sequence state carries **one block table per stage** so the three stages
-//! draw disjoint physical blocks (no aliasing at the shared layer index). The
-//! exact stage↔cache wiring is exercised only by the Commit 4 forward.
+//! ignored); the internal semi-AR block width (`dspark_block_size = 5`) is an
+//! implementation detail.
 
-use parking_lot::Mutex;
 use std::any::Any;
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use crate::layer::{ForwardContext, LayerState};
+use crate::layers::ops;
 use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_loader::deepseek_v4::DeepseekV4DSparkModule;
 use crate::weight_map::DenseWeight;
 
-/// Per-sequence state for the DeepSeek-V4 native DSpark proposer.
+/// Ring slot for an absolute main-token position: Mia's `positions %
+/// window_size` (`dspark.py:421`). Pure host math; unit-tested.
+#[inline]
+fn ring_slot(position: usize, window: usize) -> usize {
+    debug_assert!(window > 0, "ring window must be non-zero");
+    position % window
+}
+
+/// Number of leading rows of a stored segment that are *valid* (committed) when
+/// `rejected` suffix tokens are trimmed: Mia's `valid_len = (seg_len -
+/// rejected).clamp(min=1, max=seg_len)` (`dspark.py:385` / `:442`). Rows at
+/// offsets `>= valid_len` keep the ring's previous values (the rejected drafts
+/// never enter the sliding window). Pure host math; unit-tested.
+#[inline]
+#[allow(dead_code)] // encodes the reject contract the net-new store path applies (GPU lane).
+fn ring_valid_len(seg_len: usize, rejected: usize) -> usize {
+    if seg_len == 0 {
+        return 0;
+    }
+    seg_len.saturating_sub(rejected).clamp(1, seg_len)
+}
+
+/// One drafter stage's sliding-window `main_kv_cache` ring buffer — Mia
+/// `DeepSeekV4DSparkAttention.main_kv_cache` (`dspark.py:282-292`). Logical
+/// shape `[max_seqs, window, head_dim]`, BF16, zero-initialized (`torch.zeros`).
 ///
-/// Several fields (`body_states`, `last_num_drafted`) are written now but first
-/// consumed by the Commit 4 forward; the lifecycle callbacks (`after_verify` /
-/// `free_state`) already use `seq_len` + `block_tables`.
+/// The MLA-absorbed drafter KV row is `head_dim = kv_lora_rank +
+/// qk_rope_head_dim` wide, matching the target's MLA cache row so the stage
+/// projection lands at the right stride. For the K=1 single-stream serve
+/// profile (`--max-num-seqs 1`) `max_seqs = 1`.
+///
+/// The device buffer is process-lifetime (owned by the head, shared across the
+/// single stream); the per-sequence write position lives on the proposer state.
+/// A stage attention feeds the ring via `store_main_kv` (the projected main KV,
+/// scattered at `position % window`) — that projection is part of the net-new
+/// drafter stage forward and is wired in the GPU-convergence lane.
+#[allow(dead_code)] // `max_seqs`/`row_offset` consumed by the net-new stage store (GPU lane).
+struct DsparkMainKvCache {
+    /// `[max_seqs * window * head_dim]` BF16 device storage.
+    buf: DevicePtr,
+    /// Sliding-window depth (`dspark_window_size`, e.g. 128).
+    window: usize,
+    /// MLA-absorbed KV row width (`kv_lora_rank + qk_rope_head_dim`).
+    head_dim: usize,
+    /// Concurrent-sequence rows (1 for the K=1 single-stream profile).
+    max_seqs: usize,
+    /// Total byte length of `buf` (BF16).
+    bytes: usize,
+}
+
+impl DsparkMainKvCache {
+    /// Allocate + zero one stage's ring buffer.
+    fn new(gpu: &dyn GpuBackend, window: usize, head_dim: usize, max_seqs: usize) -> Result<Self> {
+        let bytes = max_seqs * window * head_dim * 2; // BF16
+        let buf = gpu.alloc(bytes)?;
+        gpu.memset(buf, 0, bytes)?; // torch.zeros init
+        Ok(Self {
+            buf,
+            window,
+            head_dim,
+            max_seqs,
+            bytes,
+        })
+    }
+
+    /// Byte offset of `(seq_row, slot)` in the flat `[max_seqs, window,
+    /// head_dim]` BF16 buffer.
+    #[allow(dead_code)] // consumed by the net-new stage `store_main_kv` (GPU lane).
+    fn row_offset(&self, seq_row: usize, slot: usize) -> usize {
+        ((seq_row * self.window) + slot) * self.head_dim * 2
+    }
+
+    /// Zero the whole ring (clean sequence boundary for the single-stream
+    /// profile — Mia keeps the buffer persistent and resets via positions; for
+    /// one stream, a zero + position reset is an exact superset).
+    fn reset(&self, gpu: &dyn GpuBackend) -> Result<()> {
+        gpu.memset(self.buf, 0, self.bytes)?;
+        Ok(())
+    }
+}
+
+/// Per-sequence state for the DeepSeek-V4 native DSpark proposer.
 #[allow(dead_code)]
 pub struct DeepseekV4DSparkProposerState {
-    /// One block table per draft stage for the drafter's OWN KV cache. The
-    /// stages share a single pool layer index but draw disjoint blocks, so a
-    /// table per stage keeps their physical slots separate.
-    pub block_tables: Vec<Vec<u32>>,
-    /// Current sequence length in the drafter KV cache.
-    pub seq_len: usize,
-    /// Drafts produced by the last `propose()` (for `after_verify` trimming).
+    /// Absolute number of committed main-KV tokens for this sequence. The ring
+    /// slot of the next write is `main_kv_pos % window` ([`ring_slot`]); it
+    /// advances by the accepted-token count each `after_verify` (rejected
+    /// drafts never enter the window — [`ring_valid_len`]). Replaces the
+    /// scaffold's per-stage paged block tables.
+    pub main_kv_pos: usize,
+    /// Drafts produced by the last `propose()` (for `after_verify` reject
+    /// accounting).
     pub last_num_drafted: usize,
     /// Per-stage state for the reused V4 bodies (MLA layers use
     /// `EmptyLayerState`, but we allocate via each stage's own `alloc_state` so
@@ -83,11 +164,6 @@ impl ProposerState for DeepseekV4DSparkProposerState {
 }
 
 /// DeepSeek-V4 native DSpark draft proposer (K=1).
-///
-/// Fields carrying the DSpark heads, shared embedding / LM head, reduced draft
-/// vocab, and kernel handles are populated now but first read by the Commit 4
-/// forward; `module.stages` (state alloc) and `kv_cache` (trim/free) are the
-/// only pieces the Commit 3 lifecycle exercises.
 #[allow(dead_code)]
 pub struct DeepseekV4DSparkHead {
     /// The loaded native DSpark module: 3 reused V4 stage bodies + DSpark heads
@@ -103,13 +179,19 @@ pub struct DeepseekV4DSparkHead {
     mtp_vocab_size: u32,
     /// Number of draft stages (`n_mtp_layers`, = `module.stages.len()`).
     num_stages: usize,
-    /// Shared single MLA-shaped KV cache pool for the drafter attention. Sized
-    /// `num_hidden_layers + 1` layers (the stages' assembled `attn_layer_idx`);
-    /// per-stage block tables (in the state) keep the stages' blocks disjoint.
-    kv_cache: Mutex<PagedKvCache>,
+    /// Semi-AR internal block width (`dspark_block_size`, = 5). The drafter
+    /// always computes the full block; K=1 emits position 0 only.
+    block_size: usize,
+    /// Noise/placeholder token id (`dspark_noise_token_id`, = 128799) filling
+    /// draft-block positions `1..block_size`.
+    noise_token_id: u32,
+    /// Per-stage sliding-window `main_kv_cache` ring buffers (one per stage,
+    /// Mia registers `main_kv_cache` per `DeepSeekV4DSparkAttention`). Shared,
+    /// process-lifetime; the per-sequence write position is on the state.
+    /// Empty when `dspark_window_size == 0` (mis-config guard).
+    main_kv_caches: Vec<DsparkMainKvCache>,
 
-    // Kernel handles (mirrors `DeepseekV4MtpHead`; consumed by the Commit 4
-    // forward).
+    // Kernel handles (mirrors `DeepseekV4MtpHead`).
     rms_norm_k: KernelHandle,
     dense_gemv_k: KernelHandle,
     residual_add_k: KernelHandle,
@@ -130,34 +212,34 @@ impl DeepseekV4DSparkHead {
         config: &atlas_core::config::ModelConfig,
         gpu: &dyn GpuBackend,
         mtp_vocab_size: u32,
-        max_seq_len: usize,
+        _max_seq_len: usize,
     ) -> Result<Self> {
         let num_stages = module.stages.len();
 
-        // Drafter KV cache: single MLA-absorbed attention shape (num_kv_heads =
-        // 1, head_dim = kv_lora_rank + qk_rope_head_dim), matching the target's
-        // MLA cache so the reused V4 body's `write_kv_cache` / `run_paged_decode`
-        // land at the correct strides. BF16 (tiny cache; avoids FP8 unit-scale
-        // collapse). Each stage was assembled with `attn_layer_idx =
-        // num_hidden_layers`, so the pool must carry `num_hidden_layers + 1`
-        // layer slots for that index to be valid (only the last is used).
-        let mla_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim;
-        let num_layers = config.num_hidden_layers + 1;
-        let kv_config = KvCacheConfig {
-            block_size: 16,
-            num_kv_heads: 1,
-            head_dim: mla_cache_dim,
-            num_layers,
-            dtype: KvCacheDtype::Bf16,
-            layer_dtypes: vec![],
-            layer_dims: vec![],
-            cache_blocks_per_seq: None,
-        };
-        // One sequence's worth of blocks PER stage (the stages draw disjoint
-        // blocks from the shared pool).
-        let per_stage_blocks = max_seq_len / kv_config.block_size + 1;
-        let dspark_num_blocks = per_stage_blocks * num_stages.max(1);
-        let kv_cache = PagedKvCache::new(kv_config, dspark_num_blocks, gpu)?;
+        // Drafter main-KV row = MLA-absorbed shape (kv_lora_rank +
+        // qk_rope_head_dim), same as the target MLA cache. BF16 (tiny; avoids
+        // FP8 unit-scale collapse).
+        let head_dim = config.kv_lora_rank + config.qk_rope_head_dim;
+        let window = config.dspark_window_size;
+        // K=1 single-stream serve profile → one ring row. (A batched profile
+        // would size this to max_num_seqs and index by the request→slot map;
+        // deferred with the batched drafter, GATE2 item 17.)
+        let max_seqs = 1usize;
+
+        // One sliding-window ring buffer per stage. A zero `window` means the
+        // checkpoint did not ship `window_size` (mis-config) — build with no
+        // rings; `propose()` guards on this.
+        let mut main_kv_caches = Vec::with_capacity(num_stages);
+        if window > 0 {
+            for _ in 0..num_stages {
+                main_kv_caches.push(DsparkMainKvCache::new(gpu, window, head_dim, max_seqs)?);
+            }
+        } else {
+            tracing::warn!(
+                "DeepSeek-V4 native DSpark: dspark_window_size == 0 — sliding-window \
+                 main_kv_cache not allocated (native DSpark drafter cannot run)"
+            );
+        }
 
         Ok(Self {
             module,
@@ -165,7 +247,9 @@ impl DeepseekV4DSparkHead {
             lm_head,
             mtp_vocab_size,
             num_stages,
-            kv_cache: Mutex::new(kv_cache),
+            block_size: config.dspark_block_size.max(1),
+            noise_token_id: config.dspark_noise_token_id,
+            main_kv_caches,
             // V4 ships HF-vanilla norm weights (norms are loaded exactly) — the
             // offset-from-1 kernel would apply `1 + w`.
             rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
@@ -177,22 +261,65 @@ impl DeepseekV4DSparkHead {
         })
     }
 
-    /// Allocate per-sequence state. Allocates one empty block table + one body
-    /// sub-state per draft stage (mirrors each stage's own `alloc_state`).
-    pub fn alloc_state_inner(
-        &self,
-        gpu: &dyn GpuBackend,
-    ) -> Result<DeepseekV4DSparkProposerState> {
+    /// Allocate per-sequence state. One body sub-state per draft stage; the ring
+    /// write position starts at 0.
+    pub fn alloc_state_inner(&self, gpu: &dyn GpuBackend) -> Result<DeepseekV4DSparkProposerState> {
         let mut body_states = Vec::with_capacity(self.num_stages);
         for stage in &self.module.stages {
             body_states.push(stage.alloc_state(gpu)?);
         }
         Ok(DeepseekV4DSparkProposerState {
-            block_tables: vec![Vec::new(); self.num_stages],
-            seq_len: 0,
+            main_kv_pos: 0,
             last_num_drafted: 0,
             body_states,
         })
+    }
+
+    /// Mia `project_main` (`dspark.py:708-711`): the block-input projection.
+    ///
+    /// `main_hidden` is the `[40,41,42]` target-hidden stack (`3 * hidden_size`
+    /// BF16, shallow-to-deep concat = the drafter's `main_hidden_in` golden).
+    /// Applies `main_proj` (`[hidden, 3*hidden]`, dequantized BF16) then
+    /// `main_norm` (vanilla RMSNorm). Writes the block-input `main_x`
+    /// (`[hidden]` BF16 = the `main_norm_out` golden) into `out`. Uses only the
+    /// existing `dense_gemv` + `rms_norm` kernels.
+    fn project_main(
+        &self,
+        main_hidden: DevicePtr,
+        out: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size as u32;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let stack_in = (h as usize * self.module.stages.len().max(1)) as u32; // 3 * hidden
+
+        // main_proj: [hidden, 3*hidden] · main_hidden[3*hidden] -> proj[hidden]
+        // (the `main_proj_out` golden). Scratch: reuse the norm-output buffer.
+        let proj = ctx.buffers.norm_output();
+        ops::dense_gemv(
+            ctx.gpu,
+            self.dense_gemv_k,
+            main_hidden,
+            &self.module.main_proj,
+            proj,
+            h,        // out_dim = hidden
+            stack_in, // in_dim  = 3 * hidden
+            stream,
+        )?;
+        // main_norm: vanilla RMSNorm -> main_x (the `main_norm_out` golden).
+        ops::rms_norm(
+            ctx.gpu,
+            self.rms_norm_k,
+            proj,
+            &self.module.main_norm,
+            out,
+            1,
+            h,
+            eps,
+            stream,
+        )?;
+        Ok(())
     }
 }
 
@@ -202,7 +329,8 @@ impl DraftProposer for DeepseekV4DSparkHead {
     }
 
     /// Chain confidence of the most recent `propose`. The DSpark confidence head
-    /// is wired in Commit 4; until then report `None` so callers do not gate.
+    /// runs inside the net-new stage forward; until that lands report `None` so
+    /// callers do not gate.
     fn last_confidence(&self) -> Option<f32> {
         None
     }
@@ -215,30 +343,73 @@ impl DraftProposer for DeepseekV4DSparkHead {
         _position: usize,
         num_drafts: usize,
         state: &mut dyn ProposerState,
-        _ctx: &ForwardContext,
-        _stream: u64,
+        ctx: &ForwardContext,
+        stream: u64,
         _draft_embed_target: Option<DevicePtr>,
         _grammar_bitmask: Option<&[i32]>,
-        _target_hidden_stack: Option<DevicePtr>,
+        target_hidden_stack: Option<DevicePtr>,
     ) -> Result<Vec<u32>> {
-        // Downcast to validate the state shape even though we draft nothing —
-        // keeps the install path honest and mirrors the MTP head's contract.
         let _dspark_state = state
             .as_any_mut()
             .downcast_mut::<DeepseekV4DSparkProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid V4 DSpark proposer state"))?;
 
-        // Externally K=1: the semi-AR block width is internal to the deferred
-        // forward; a caller asking for >1 draft gets none until Commit 4.
+        // Externally K=1: the semi-AR block width is internal; a caller asking
+        // for >1 draft gets pos-0 only (once the forward lands).
         if num_drafts > 1 {
             tracing::warn!(
-                "V4 DSpark proposer is K=1; num_drafts={num_drafts} ignored (scaffold drafts none)"
+                "V4 DSpark proposer is K=1; num_drafts={num_drafts} ignored (emits block pos-0)"
             );
         }
 
-        tracing::debug!("DSpark propose scaffold — forward convergence lands in Commit 4");
-        // Commit 4: real forward (forward_embed → 3 stages → hc_head → base
-        // logits → serial markov → confidence → slice[:1]).
+        // No sliding-window ring (mis-config) → cannot draft.
+        if self.main_kv_caches.is_empty() {
+            tracing::debug!("DSpark propose: no main_kv_cache ring (window==0) — drafting none");
+            return Ok(Vec::new());
+        }
+
+        // ── Mia `draft()` step (a): block-input projection (dspark.py:884) ──
+        // main_proj → main_norm over the [40,41,42] target-hidden stack. This
+        // exercises the `main_hidden_in` → `main_proj_out` → `main_norm_out`
+        // golden boundaries with existing kernels; the resulting `main_x` is
+        // the block input the net-new stage forward consumes.
+        if let Some(main_hidden) = target_hidden_stack {
+            let main_x = ctx.buffers.hidden_states();
+            self.project_main(main_hidden, main_x, ctx, stream)?;
+            tracing::debug!("DSpark propose: project_main done (main_norm_out ready)");
+        } else {
+            tracing::debug!("DSpark propose: no target_hidden_stack — skipping project_main");
+        }
+
+        // ── STOP — net-new drafter kernel boundary (GATE3 correction #3) ──
+        //
+        // The remaining Mia `draft()` body (dspark.py:888-995) is the semi-AR
+        // block forward and does NOT reuse the target's per-token MLA decode:
+        //   • build block_size(=5) noise block (`[:,0]=accepted`), embed,
+        //     expand to hc_mult streams (dspark.py:888-895);
+        //   • 3× stage `forward_dspark` — each: mHC-pre → attn_norm →
+        //     **sparse-MLA over the sliding-window main_kv_cache + block
+        //     draft_kv with an attn_sink normalizer** (`dspark_sparse_attention`,
+        //     dspark_kernels.py:716) → fp8-einsum o-proj
+        //     (`deepseek_v4_fp8_einsum`) → hc_post → mHC-pre → ffn_norm → MoE
+        //     (reuses the target MegaMoE) → hc_post (dspark.py:471-540/741-779);
+        //   • hc_head collapse → final norm → base logits;
+        //   • serial-Markov argmax loop (`logits[:,pos] += markov; argmax`,
+        //     dspark.py:980-985); confidence sigmoid (dspark.py:987-990);
+        //   • emit block pos-0 for K=1 (`draft_token_ids[:, :1]`, PROP:1032).
+        //
+        // The sparse windowed attention, the block KV projection
+        // (`_project_q_and_draft_kv`), and the fp8-einsum o-projection are a
+        // **net-new drafter kernel surface** absent from Atlas's per-token MLA
+        // decode. They are authored + compiled + convergence-tested in the
+        // image-build / GPU lane (a CUDA build this session cannot run). Until
+        // then `propose()` drafts nothing rather than silently substituting the
+        // wrong (per-token MLA) attention, which would diverge on the
+        // `stage_out` goldens.
+        tracing::debug!(
+            "DSpark propose: semi-AR block forward (sparse-MLA stages) is the net-new \
+             kernel boundary — drafting none pending the GPU-convergence lane"
+        );
         Ok(Vec::new())
     }
 
@@ -252,69 +423,123 @@ impl DraftProposer for DeepseekV4DSparkHead {
             .as_any_mut()
             .downcast_mut::<DeepseekV4DSparkProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid V4 DSpark proposer state"))?;
-        // Trim `drafted - accepted` rejected rows by rolling back `seq_len`
-        // (the slots are overwritten on the next propose). Mirrors
-        // `DeepseekV4MtpHead::after_verify`.
-        let num_drafted = dspark_state.last_num_drafted.max(1);
-        let num_to_trim = num_drafted.saturating_sub(num_accepted);
-        let old_sl = dspark_state.seq_len;
-        if num_to_trim > 0 {
-            dspark_state.seq_len = dspark_state.seq_len.saturating_sub(num_to_trim);
-        }
+
+        // Sliding-window ring advance (Mia items 18-20): the accepted tokens
+        // become committed main context and advance the ring write position;
+        // the rejected suffix never enters the window (`valid_len = seg_len -
+        // rejected`, [`ring_valid_len`]). Position advances by accepted count.
+        let num_drafted = dspark_state.last_num_drafted;
+        let num_rejected = num_drafted.saturating_sub(num_accepted);
+        let old_pos = dspark_state.main_kv_pos;
+        dspark_state.main_kv_pos = dspark_state.main_kv_pos.saturating_add(num_accepted);
         tracing::debug!(
             "V4 DSpark after_verify: accepted={num_accepted} drafted={num_drafted} \
-             trim={num_to_trim} dspark_seq_len: {old_sl} → {}",
-            dspark_state.seq_len,
+             rejected={num_rejected} main_kv_pos: {old_pos} → {} (slot {})",
+            dspark_state.main_kv_pos,
+            self.main_kv_caches
+                .first()
+                .map(|c| ring_slot(dspark_state.main_kv_pos, c.window))
+                .unwrap_or(0),
         );
         Ok(())
     }
 
-    fn free_state(&self, _gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
+    fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
         let dspark_state = state
             .as_any_mut()
             .downcast_mut::<DeepseekV4DSparkProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid V4 DSpark proposer state"))?;
-        let mut kv_cache = self.kv_cache.lock();
-        for block_table in &mut dspark_state.block_tables {
-            if !block_table.is_empty() {
-                kv_cache.free_blocks(block_table);
-                block_table.clear();
-            }
+        // Single-stream profile: zero the shared rings + reset the write
+        // position at the sequence boundary (Mia keeps buffers persistent and
+        // resets via positions; a zero is a safe superset for one stream).
+        for cache in &self.main_kv_caches {
+            cache.reset(gpu)?;
         }
-        drop(kv_cache);
-        dspark_state.seq_len = 0;
+        dspark_state.main_kv_pos = 0;
+        dspark_state.last_num_drafted = 0;
         Ok(())
     }
 }
+
+// The head owns the ring device buffers, released with the backend at teardown
+// (process-lifetime, exactly like `DeepseekV4MtpHead`'s KV pool). `DevicePtr`
+// has no `Drop`, so no per-head free is issued — consistent with the MTP head.
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // The state alloc/free roundtrip proper needs a GPU (PagedKvCache); the
-    // no-GPU seam is the `ProposerState` downcast + the `seq_len` trim math the
-    // lifecycle callbacks perform. Build a bare state, box it as
-    // `dyn ProposerState`, and exercise both.
+    // ── Sliding-window ring index contract (host math; no GPU) ──
+
     #[test]
-    fn dspark_state_downcast_and_trim_roundtrip() {
+    fn ring_slot_wraps_at_window() {
+        let window = 128;
+        assert_eq!(ring_slot(0, window), 0);
+        assert_eq!(ring_slot(127, window), 127);
+        assert_eq!(ring_slot(128, window), 0, "wraps at window");
+        assert_eq!(ring_slot(129, window), 1);
+        assert_eq!(ring_slot(2 * window + 5, window), 5, "second wrap");
+    }
+
+    #[test]
+    fn ring_valid_len_matches_mia_clamp() {
+        // Mia: valid_len = (seg_len - rejected).clamp(min=1, max=seg_len).
+        assert_eq!(ring_valid_len(5, 0), 5, "no reject → all valid");
+        assert_eq!(ring_valid_len(5, 2), 3, "3 of 5 committed");
+        assert_eq!(ring_valid_len(5, 4), 1, "one always committed");
+        assert_eq!(ring_valid_len(5, 5), 1, "clamp min=1 even at full reject");
+        assert_eq!(ring_valid_len(5, 10), 1, "over-reject clamps to 1");
+        assert_eq!(ring_valid_len(0, 3), 0, "empty segment stays empty");
+    }
+
+    #[test]
+    fn ring_row_offset_layout() {
+        // [max_seqs, window, head_dim] BF16, row-major.
+        let c = DsparkMainKvCache {
+            buf: DevicePtr::NULL,
+            window: 128,
+            head_dim: 576,
+            max_seqs: 1,
+            bytes: 128 * 576 * 2,
+        };
+        assert_eq!(c.row_offset(0, 0), 0);
+        assert_eq!(
+            c.row_offset(0, 1),
+            576 * 2,
+            "next slot = head_dim BF16 rows"
+        );
+        assert_eq!(c.row_offset(0, 127), 127 * 576 * 2);
+    }
+
+    // ── after_verify ring-advance semantics (accepted advances; rejected does
+    // not enter the window) ──
+    #[test]
+    fn after_verify_advances_by_accepted_only() {
+        // Simulate the position math after_verify performs.
+        let advance = |pos: usize, drafted: usize, accepted: usize| -> (usize, usize) {
+            let rejected = drafted.saturating_sub(accepted);
+            (pos.saturating_add(accepted), rejected)
+        };
+        // Drafted K=1, accepted 1 → advance 1, reject 0.
+        assert_eq!(advance(10, 1, 1), (11, 0));
+        // Drafted 1, accepted 0 (reject) → no advance, reject 1.
+        assert_eq!(advance(10, 1, 0), (10, 1));
+        // Bonus-only step (drafted 0) → advance by the bonus (accepted).
+        assert_eq!(advance(10, 0, 1), (11, 0));
+    }
+
+    #[test]
+    fn dspark_state_downcast_roundtrip() {
         let mut state: Box<dyn ProposerState> = Box::new(DeepseekV4DSparkProposerState {
-            block_tables: vec![Vec::new(); 3],
-            seq_len: 10,
-            last_num_drafted: 4,
+            main_kv_pos: 200,
+            last_num_drafted: 1,
             body_states: Vec::new(),
         });
-
         let s = state
             .as_any_mut()
             .downcast_mut::<DeepseekV4DSparkProposerState>()
             .expect("downcast to DSpark state");
-        assert_eq!(s.block_tables.len(), 3, "one block table per stage");
-
-        // Mirror `after_verify`: drafted=4, accepted=1 ⇒ trim 3 rows.
-        let num_drafted = s.last_num_drafted.max(1);
-        let num_to_trim = num_drafted.saturating_sub(1);
-        s.seq_len = s.seq_len.saturating_sub(num_to_trim);
-        assert_eq!(num_to_trim, 3);
-        assert_eq!(s.seq_len, 7, "seq_len rolled back by drafted-accepted");
+        // Ring slot of the current write position (window 128): 200 % 128 = 72.
+        assert_eq!(ring_slot(s.main_kv_pos, 128), 72);
     }
 }
