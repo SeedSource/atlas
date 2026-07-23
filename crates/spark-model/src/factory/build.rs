@@ -144,6 +144,32 @@ pub fn build_model(
             config.dflash_capture_layers,
             sub.target_layer_ids,
         );
+    } else if config.model_type == "deepseek_v4"
+        && use_speculative
+        && !config.dspark_target_layer_ids.is_empty()
+    {
+        // Native DSpark speculative decoding reuses the same post-layer hidden
+        // capture as DFlash (Commit 2's `hc_stream_mean` reduction fires for the
+        // listed layers) but is driven by `--speculative` + the checkpoint's
+        // `dspark_target_layer_ids`, not a `--dflash` drafter config. Populate
+        // the capture-layer indices here — with the same HF `output_hidden_states`
+        // −1 offset — so `TransformerModel::new` allocates the capture buffer and
+        // the target forward captures `[40, 41, 42]` for the drafter.
+        let offset: i64 = std::env::var("ATLAS_DFLASH_CAPTURE_LAYER_OFFSET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1);
+        let capture_layers: Vec<usize> = config
+            .dspark_target_layer_ids
+            .iter()
+            .map(|&id| (id as i64 + offset).max(0) as usize)
+            .collect();
+        tracing::info!(
+            "DSpark: target layer capture indices = {:?} (offset={offset} from raw {:?})",
+            capture_layers,
+            config.dspark_target_layer_ids,
+        );
+        config.dflash_capture_layers = capture_layers;
     }
 
     // ── Step 2: Load weights (model-agnostic from here) ──
@@ -173,9 +199,50 @@ pub fn build_model(
     // verification then dropped.
     // Only rank 0 runs the MTP draft (no-EP, all experts local). Skip loading it
     // on the worker ranks — they never call propose(), so it would be dead weight.
-    let v4_mtp_module =
-        if config.model_type == "deepseek_v4" && use_speculative && config.ep_rank == 0 {
-            match crate::weight_loader::deepseek_v4::load_v4_mtp_module(
+    //
+    // DeepSeek-V4 ships two MUTUALLY EXCLUSIVE drafter checkpoint shapes,
+    // disambiguated by the detection tensor: the native DSpark 3-stage drafter
+    // (`mtp.0.main_proj.weight`) vs the NVIDIA-style single-module MTP combiner
+    // (`mtp.0.enorm.weight`). A native ckpt loads the DSpark module ONLY; an
+    // NVIDIA ckpt loads the MTP module ONLY — never both.
+    let native_dspark = config.model_type == "deepseek_v4"
+        && use_speculative
+        && config.ep_rank == 0
+        && store.contains("mtp.0.main_proj.weight");
+
+    let v4_dspark_module = if native_dspark {
+        match crate::weight_loader::deepseek_v4::load_v4_dspark_module(
+            store,
+            &config,
+            gpu.as_ref(),
+            &attn_layer_dtypes,
+        ) {
+            Ok(Some(m)) => {
+                tracing::info!(
+                    "DeepSeek-V4 native DSpark drafter module loaded OK (num_mtp_modules={})",
+                    config.num_mtp_modules
+                );
+                Some(m)
+            }
+            Ok(None) => {
+                tracing::info!("DeepSeek-V4: no native DSpark module in checkpoint");
+                None
+            }
+            Err(e) => {
+                tracing::error!("DeepSeek-V4 native DSpark module load FAILED: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let v4_mtp_module = if config.model_type == "deepseek_v4"
+        && use_speculative
+        && config.ep_rank == 0
+        && !native_dspark
+    {
+        match crate::weight_loader::deepseek_v4::load_v4_mtp_module(
                 store,
                 &config,
                 gpu.as_ref(),
@@ -596,6 +663,36 @@ pub fn build_model(
             }
             Err(e) => tracing::warn!(
                 "Failed to build DeepSeek-V4 MTP proposer: {e:#}. Speculative decoding disabled."
+            ),
+        }
+    }
+
+    // ── Step 6c: DeepSeek-V4 native DSpark proposer (optional, post-construction) ──
+    //
+    // MUTUALLY EXCLUSIVE with the NVIDIA MTP head above — the load path fills at
+    // most one of `v4_dspark_module` / `v4_mtp_module` (gated by the detection
+    // tensor), so at most one `set_dflash_proposer` fires — and with DFlash below
+    // (CLI-exclusive with `--speculative`). Shares the target's BF16 embedding +
+    // LM head (`DenseWeight` is `Copy`, so reused from the MTP capture above).
+    if let Some(v4_dspark) = v4_dspark_module {
+        match crate::layers::DeepseekV4DSparkHead::new(
+            v4_dspark,
+            v4_mtp_embed,
+            v4_mtp_lm_head,
+            model.config_ref(),
+            model.gpu_backend(),
+            mtp_vocab_size,
+            max_seq_len,
+        ) {
+            Ok(head) => {
+                model.set_dflash_proposer(std::sync::Arc::new(head));
+                tracing::info!(
+                    "DeepSeek-V4 native DSpark speculative decoding: ENABLED (K=1)"
+                );
+            }
+            Err(e) => tracing::warn!(
+                "Failed to build DeepSeek-V4 native DSpark proposer: {e:#}. \
+                 Speculative decoding disabled."
             ),
         }
     }

@@ -45,7 +45,6 @@ use crate::layers::qwen3_attention::HcHeadWeights;
 use crate::weight_map::{DenseWeight, dense_auto};
 
 /// Number of native DSpark draft stages (`n_mtp_layers = 3`).
-#[allow(dead_code)]
 const NUM_DSPARK_STAGES: usize = 3;
 
 /// A loaded DeepSeek-V4 **native DSpark** drafter: the 3 reused V4 transformer
@@ -54,9 +53,11 @@ const NUM_DSPARK_STAGES: usize = 3;
 /// Embedding + lm_head are shared with the parent model and supplied at
 /// proposer-build time.
 //
-// Consumed by the (forthcoming) native-DSpark K=1 proposer (Commit 2). Marked
-// dead_code here so the standalone loader commit builds clean under
-// `#![deny(warnings)]`, mirroring `super::mtp::DeepseekV4MtpModule`.
+// Consumed by the native-DSpark K=1 proposer (`crate::layers::DeepseekV4DSparkHead`).
+// The struct-level `allow(dead_code)` stays because the head fields
+// (`main_proj`/`main_norm`/`norm`/`markov_*`/`confidence_proj`/`hc_head`) are
+// first READ by the Commit 4 forward; the Commit 3 lifecycle reads `stages`
+// only. Mirrors `super::mtp::DeepseekV4MtpModule`.
 #[allow(dead_code)]
 pub struct DeepseekV4DSparkModule {
     /// The 3 reused V4 layer bodies (MLA + mHC + MoE), built from the
@@ -89,7 +90,6 @@ pub struct DeepseekV4DSparkModule {
 /// engages only when MTP is enabled (`num_mtp_modules != 0`) AND the checkpoint
 /// ships the native `mtp.0.main_proj` tensor. Factored out so the gate is
 /// unit-testable without a GPU / `WeightStore`.
-#[allow(dead_code)]
 fn dspark_present(num_mtp_modules: usize, has_main_proj: bool) -> bool {
     num_mtp_modules != 0 && has_main_proj
 }
@@ -102,10 +102,9 @@ fn dspark_present(num_mtp_modules: usize, has_main_proj: bool) -> bool {
 /// checkpoint, which `super::mtp` handles instead). Safe to call unconditionally
 /// on the V4 load path.
 //
-// Consumed by the (forthcoming) native-DSpark K=1 proposer (Commit 2); marked
-// dead_code so this loader-only commit builds clean under `#![deny(warnings)]`,
-// mirroring `super::mtp::load_v4_mtp_module` (which is already wired in).
-#[allow(dead_code)]
+// Wired into the V4 load path (`factory::build`) and consumed by the
+// native-DSpark K=1 proposer (`crate::layers::DeepseekV4DSparkHead`), mirroring
+// `super::mtp::load_v4_mtp_module`.
 pub fn load_v4_dspark_module(
     store: &WeightStore,
     config: &ModelConfig,
