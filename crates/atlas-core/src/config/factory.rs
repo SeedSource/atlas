@@ -112,6 +112,7 @@ impl ModelConfig {
             dspark_markov_rank: 0,
             dspark_noise_token_id: 0,
             dspark_target_layer_ids: Vec::new(),
+            dspark_window_size: 0,
             rotary_dim: 0,
             dflash_capture_layers: Vec::new(),
             adapter_max_rank: 0,

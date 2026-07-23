@@ -390,6 +390,14 @@ pub struct ModelConfig {
     /// (`dspark_target_layer_ids`, e.g. `[40, 41, 42]`). Empty = unused.
     #[serde(default)]
     pub dspark_target_layer_ids: Vec<usize>,
+    /// Native DSpark drafter sliding-window size (`window_size` in the DSpark
+    /// drafter config.json, e.g. `128`). This is the ring-buffer depth of the
+    /// per-stage `main_kv_cache` (`DeepSeekV4DSparkAttention.main_kv_cache`,
+    /// Mia `dspark.py:282-292`): an absolute main-token position `p` maps to
+    /// ring slot `p % dspark_window_size`. 0 = unused / not a native DSpark
+    /// checkpoint. Distinct from the Gemma-style target `sliding_window`.
+    #[serde(default)]
+    pub dspark_window_size: usize,
     /// Explicit rotary dimension from config (bypasses partial_rotary_factor
     /// computation). MiniMax M2 ships `rotary_dim: 64` while head_dim=128,
     /// so the rotary factor is 0.5 — we honor the explicit int value when
