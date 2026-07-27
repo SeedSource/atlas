@@ -21,6 +21,20 @@ use crate::weight_loader::load_dflash_weights;
 
 mod kv_summary;
 
+/// Map native-DSpark `dspark_target_layer_ids` to the after-layer capture
+/// indices stored in `dflash_capture_layers`. DSpark captures each target
+/// layer L's own post-`hc_post` residual (Atlas after-layer L), so the correct
+/// offset is **0** — the raw ids pass through. (DFlash uses −1 for HF
+/// `output_hidden_states` semantics; DSpark must not inherit that shift, or the
+/// [40,41,42] stack lands one layer low — see the reject-step block-cos proof
+/// in DSPARK-K1-MAINNORM-GATE-20260727.md.) Indices clamp at 0.
+fn dspark_capture_layers(target_layer_ids: &[usize], offset: i64) -> Vec<usize> {
+    target_layer_ids
+        .iter()
+        .map(|&id| (id as i64 + offset).max(0) as usize)
+        .collect()
+}
+
 pub fn build_model(
     mut config: ModelConfig,
     store: &WeightStore,
@@ -151,19 +165,21 @@ pub fn build_model(
         // Native DSpark speculative decoding reuses the same post-layer hidden
         // capture as DFlash (Commit 2's `hc_stream_mean` reduction fires for the
         // listed layers) but is driven by `--speculative` + the checkpoint's
-        // `dspark_target_layer_ids`, not a `--dflash` drafter config. Populate
-        // the capture-layer indices here — with the same HF `output_hidden_states`
-        // −1 offset — so `TransformerModel::new` allocates the capture buffer and
-        // the target forward captures `[40, 41, 42]` for the drafter.
+        // `dspark_target_layer_ids`, not a `--dflash` drafter config.
+        //
+        // Unlike DFlash (Qwen `output_hidden_states`, which needs a −1 shift),
+        // the reference DSpark drafter captures each target layer L's OWN
+        // post-`hc_post` mean (`hidden_states.mean(dim=1)`), i.e. Atlas
+        // after-layer L — so the DSpark default offset is **0**, not −1.
+        // (Empirically proven: at −1 the golden [40,41,42] blocks matched Atlas
+        // slots shifted by +1 — reject-step block cos b1↔g0=0.987, b2↔g1=0.987;
+        // offset 0 aligns slot j == golden block j. See spark-bench
+        // DSPARK-K1-MAINNORM-GATE-20260727.md.) Env override kept for A/B.
         let offset: i64 = std::env::var("ATLAS_DFLASH_CAPTURE_LAYER_OFFSET")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(-1);
-        let capture_layers: Vec<usize> = config
-            .dspark_target_layer_ids
-            .iter()
-            .map(|&id| (id as i64 + offset).max(0) as usize)
-            .collect();
+            .unwrap_or(0);
+        let capture_layers = dspark_capture_layers(&config.dspark_target_layer_ids, offset);
         tracing::info!(
             "DSpark: target layer capture indices = {:?} (offset={offset} from raw {:?})",
             capture_layers,
@@ -738,4 +754,29 @@ pub fn build_model(
     model.set_lora_weights(lora_weights)?;
 
     Ok(Box::new(model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dspark_capture_layers;
+
+    #[test]
+    fn dspark_capture_layers_default_offset_is_identity() {
+        // DSpark default offset 0 → capture the target layers' own post-hc_post
+        // residual: raw [40,41,42] map to after-layer [40,41,42], slot j == golden
+        // block j. This is the fix for the +1 block shift (was offset −1 → [39,40,41]).
+        assert_eq!(dspark_capture_layers(&[40, 41, 42], 0), vec![40, 41, 42]);
+    }
+
+    #[test]
+    fn dspark_capture_layers_minus_one_reproduces_the_old_bug() {
+        // Guard: −1 is the DFlash convention and is WRONG for DSpark (it shifted
+        // the [40,41,42] stack one layer low, failing the main_hidden_in gate).
+        assert_eq!(dspark_capture_layers(&[40, 41, 42], -1), vec![39, 40, 41]);
+    }
+
+    #[test]
+    fn dspark_capture_layers_clamps_at_zero() {
+        assert_eq!(dspark_capture_layers(&[0, 1], -1), vec![0, 0]);
+    }
 }
