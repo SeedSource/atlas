@@ -194,11 +194,16 @@ pub fn parse_deepseek_v4(json: &str) -> Result<ModelConfig> {
             .filter_map(|v| v.as_u64().map(|x| x as usize))
             .collect();
     }
-    // The drafter sliding-window depth lives at the DSpark config top level as
-    // `window_size` (e.g. 128). Only meaningful on a native DSpark checkpoint,
-    // so gate on `dspark_block_size` to avoid capturing an unrelated key.
+    // The drafter sliding-window depth = `config.sliding_window` (reference
+    // dsv4_nvidia/dspark.py:209 `self.window_size = config.sliding_window`).
+    // Real DSpark checkpoints ship it as `sliding_window` (e.g. 128); accept the
+    // legacy `window_size` spelling as a fallback. Only meaningful on a native
+    // DSpark checkpoint, so gate on `dspark_block_size`.
     if config.dspark_block_size > 0
-        && let Some(v) = raw.get("window_size").and_then(|v| v.as_u64())
+        && let Some(v) = raw
+            .get("sliding_window")
+            .or_else(|| raw.get("window_size"))
+            .and_then(|v| v.as_u64())
     {
         config.dspark_window_size = v as usize;
     }

@@ -198,6 +198,11 @@ pub struct DeepseekV4DSparkHead {
     hc_expand_k: KernelHandle,
     hc_head_k: KernelHandle,
     argmax_k: KernelHandle,
+
+    /// Monotonic `propose()` call index, appended to boundary-dump filenames so
+    /// successive calls do not overwrite (used only when `ATLAS_DSPARK_DUMP_DIR`
+    /// is armed; lets the offline harness content-match the golden step).
+    dump_call: std::sync::atomic::AtomicUsize,
 }
 
 impl DeepseekV4DSparkHead {
@@ -258,6 +263,7 @@ impl DeepseekV4DSparkHead {
             hc_expand_k: gpu.kernel("hyper_connection", "hc_expand")?,
             hc_head_k: gpu.kernel("hyper_connection", "hc_head")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
+            dump_call: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -294,6 +300,17 @@ impl DeepseekV4DSparkHead {
         let eps = ctx.config.rms_norm_eps as f32;
         let stack_in = (h as usize * self.module.stages.len().max(1)) as u32; // 3 * hidden
 
+        // One dump index per project_main invocation (shared by the 3 boundary
+        // files so the harness groups them). Only read when dumping is armed.
+        let call = self
+            .dump_call
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Dump the [40,41,42] input stack (boundary #1 `main_hidden_in`) so a
+        // `main_norm_out` divergence localizes to the upstream target capture
+        // vs project_main itself.
+        self.dump_boundary(ctx, main_hidden, "main_hidden_in", call, 1, stack_in, stream)?;
+
         // main_proj: [hidden, 3*hidden] · main_hidden[3*hidden] -> proj[hidden]
         // (the `main_proj_out` golden). Scratch: reuse the norm-output buffer.
         let proj = ctx.buffers.norm_output();
@@ -319,6 +336,46 @@ impl DeepseekV4DSparkHead {
             eps,
             stream,
         )?;
+
+        // Golden boundary dump (armed by `ATLAS_DSPARK_DUMP_DIR`): the
+        // `main_proj_out` (`proj`) and `main_norm_out` (`out`) tensors, so the
+        // offline harness can gate `project_main` against the Mia goldens
+        // before any net-new kernel lands. No-op when the env is unset.
+        self.dump_boundary(ctx, proj, "main_proj_out", call, 1, h, stream)?;
+        self.dump_boundary(ctx, out, "main_norm_out", call, 1, h, stream)?;
+        Ok(())
+    }
+
+    /// Dump a BF16 device tensor to `$ATLAS_DSPARK_DUMP_DIR/{tag}__r{rows}_c{cols}_bf16.bin`
+    /// (raw little-endian BF16, row-major). Mirrors the DFLASH `block_dump_buf`
+    /// idiom (sync + D2H + raw write); the shape is encoded in the filename so
+    /// the compare harness needs no sidecar. No-op unless the env var is set.
+    fn dump_boundary(
+        &self,
+        ctx: &ForwardContext,
+        src: DevicePtr,
+        tag: &str,
+        call: usize,
+        rows: u32,
+        cols: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let Ok(dir) = std::env::var("ATLAS_DSPARK_DUMP_DIR") else {
+            return Ok(());
+        };
+        if dir.is_empty() {
+            return Ok(());
+        }
+        let gpu = ctx.gpu;
+        let n_bytes = rows as usize * cols as usize * 2; // BF16
+        gpu.synchronize(stream)?;
+        let mut buf = vec![0u8; n_bytes];
+        gpu.copy_d2h(src, &mut buf)?;
+        let path = format!("{dir}/{tag}__call{call:04}__r{rows}_c{cols}_bf16.bin");
+        match std::fs::write(&path, &buf) {
+            Ok(()) => tracing::info!("DSPARK DUMP: wrote {path} ({rows}x{cols} BF16)"),
+            Err(e) => tracing::warn!("DSPARK DUMP: write {path} failed: {e}"),
+        }
         Ok(())
     }
 }
