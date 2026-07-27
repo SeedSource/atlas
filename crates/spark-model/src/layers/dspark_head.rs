@@ -378,6 +378,47 @@ impl DeepseekV4DSparkHead {
         }
         Ok(())
     }
+
+    /// Route-B diagnostic injection (default OFF). When
+    /// `ATLAS_DSPARK_INJECT_MAIN_HIDDEN` is a file path, load it as the
+    /// block-input `main_hidden` (raw little-endian BF16, logical shape
+    /// `[1, hidden_size * num_stages]`) so `project_main` can be gated against
+    /// the golden in isolation, free of live generation/token drift. Validates
+    /// the exact byte count (= shape × BF16) and **fails loudly** on any
+    /// mismatch — wrong tensor/dtype/rank refuses to inject rather than
+    /// silently transform garbage. Returns a freshly-allocated device buffer
+    /// the caller must `free`; `None` when the env is unset/empty (production).
+    fn maybe_inject_main_hidden(&self, ctx: &ForwardContext) -> Result<Option<DevicePtr>> {
+        let Ok(path) = std::env::var("ATLAS_DSPARK_INJECT_MAIN_HIDDEN") else {
+            return Ok(None);
+        };
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let stack_in = ctx.config.hidden_size * self.num_stages.max(1);
+        let expected = stack_in * 2; // BF16 [1, hidden * num_stages]
+        let bytes = std::fs::read(&path)
+            .map_err(|e| anyhow::anyhow!("DSPARK INJECT: cannot read {path}: {e}"))?;
+        if bytes.len() != expected {
+            anyhow::bail!(
+                "DSPARK INJECT: {path} is {} bytes, expected {} ([1,{}] BF16, hidden={} × \
+                 stages={}). Wrong tensor / dtype / rank — refusing to inject.",
+                bytes.len(),
+                expected,
+                stack_in,
+                ctx.config.hidden_size,
+                self.num_stages
+            );
+        }
+        let buf = ctx.gpu.alloc(expected)?;
+        ctx.gpu.copy_h2d(&bytes, buf)?;
+        tracing::warn!(
+            "DSPARK INJECT ACTIVE (DIAGNOSTIC): main_hidden ← {path} ({} BF16 elems). Output is \
+             NOT from the live target capture — must never be set in production.",
+            stack_in
+        );
+        Ok(Some(buf))
+    }
 }
 
 impl DraftProposer for DeepseekV4DSparkHead {
@@ -430,12 +471,23 @@ impl DraftProposer for DeepseekV4DSparkHead {
         // exercises the `main_hidden_in` → `main_proj_out` → `main_norm_out`
         // golden boundaries with existing kernels; the resulting `main_x` is
         // the block input the net-new stage forward consumes.
-        if let Some(main_hidden) = target_hidden_stack {
+        // Route-B prologue isolation (DIAGNOSTIC, default OFF): when
+        // `ATLAS_DSPARK_INJECT_MAIN_HIDDEN` points at a raw-BF16 golden
+        // `main_hidden_in`, inject it as the block-input in place of the live
+        // target capture — removes generation/token drift so `project_main`
+        // (main_proj + main_norm) can be gated against the golden in isolation.
+        // No-op unless the env is set; fails loudly on any shape/byte mismatch.
+        let injected = self.maybe_inject_main_hidden(ctx)?;
+        let main_hidden_src = injected.or(target_hidden_stack);
+        if let Some(main_hidden) = main_hidden_src {
             let main_x = ctx.buffers.hidden_states();
             self.project_main(main_hidden, main_x, ctx, stream)?;
             tracing::debug!("DSpark propose: project_main done (main_norm_out ready)");
         } else {
             tracing::debug!("DSpark propose: no target_hidden_stack — skipping project_main");
+        }
+        if let Some(p) = injected {
+            ctx.gpu.free(p)?;
         }
 
         // ── STOP — net-new drafter kernel boundary (GATE3 correction #3) ──
