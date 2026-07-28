@@ -244,7 +244,11 @@ impl DeepseekV4DSparkHead {
         // Drafter main-KV row = MLA-absorbed shape (kv_lora_rank +
         // qk_rope_head_dim), same as the target MLA cache. BF16 (tiny; avoids
         // FP8 unit-scale collapse).
-        let head_dim = config.kv_lora_rank + config.qk_rope_head_dim;
+        // Drafter attention uses the DIRECT head_dim (qk_nope + qk_rope =
+        // config.head_dim), NOT the absorbed kv_lora+rope. The reference
+        // `_project_q_and_draft_kv` splits `head_dim` off `fused_wqa_wkv`; the
+        // dumped ring is `[max_seqs, window, head_dim]` (= 512 for V4-Flash).
+        let head_dim = config.head_dim;
         let window = config.dspark_window_size;
         // K=1 single-stream serve profile → one ring row. (A batched profile
         // would size this to max_num_seqs and index by the request→slot map;
@@ -544,8 +548,8 @@ impl DeepseekV4DSparkHead {
         let q_lora = mla.q_lora_rank as u32;
         let o_lora = mla.o_lora_rank as u32;
         let rope = mla.rope as u32;
-        let hd = (mla.kv_lora_rank + mla.rope) as u32; // head_dim = kv_lora + rope
-        let nope = hd - rope; // = kv_lora
+        let hd = ctx.config.head_dim as u32; // direct head_dim = qk_nope + qk_rope (= 512)
+        let nope = mla.nope as u32; // qk_nope_head_dim (= 448); rope lanes are the trailing `rope`
         let window = ring.window as u32;
         let scale = (hd as f32).powf(-0.5);
         let o_groups = ctx.config.o_groups.max(1) as u32;
