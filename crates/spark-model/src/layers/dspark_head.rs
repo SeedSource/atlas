@@ -231,6 +231,9 @@ pub struct DeepseekV4DSparkHead {
     /// successive calls do not overwrite (used only when `ATLAS_DSPARK_DUMP_DIR`
     /// is armed; lets the offline harness content-match the golden step).
     dump_call: std::sync::atomic::AtomicUsize,
+    /// Chain confidence (position-0 sigmoid) of the most recent `propose`, f32
+    /// bits. NaN sentinel = not yet computed (`last_confidence()` → None).
+    last_conf: std::sync::atomic::AtomicU32,
 }
 
 impl DeepseekV4DSparkHead {
@@ -323,6 +326,7 @@ impl DeepseekV4DSparkHead {
                 DenseWeight { weight: ptr }
             },
             dump_call: std::sync::atomic::AtomicUsize::new(0),
+            last_conf: std::sync::atomic::AtomicU32::new(f32::NAN.to_bits()),
         })
     }
 
@@ -414,6 +418,9 @@ impl DeepseekV4DSparkHead {
     /// per stage for the golden gate. The FP32 highway is ping-ponged between two
     /// buffers so `hc_post` never aliases its own residual (it mixes multiple
     /// residual streams through the doubly-stochastic `comb`).
+    /// Full drafter forward: 3 stage forwards + head path → K=1 proposal token.
+    /// Returns `Some(token)` (block position-0 argmax) or `None` if the block is
+    /// empty. Boundary dumps inside are env-gated (production-neutral).
     fn run_stage_forward_dev(
         &self,
         last_token: u32,
@@ -421,7 +428,7 @@ impl DeepseekV4DSparkHead {
         main_x: DevicePtr,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<()> {
+    ) -> Result<Option<u32>> {
         use crate::layers::qwen3_attention::Qwen3AttentionLayer;
         let gpu = ctx.gpu;
         let h = ctx.config.hidden_size as u32;
@@ -563,12 +570,91 @@ impl DeepseekV4DSparkHead {
             }
         }
 
+        // ── HEAD PATH (post-3-stage → K=1 proposal) ──
+        // `cur` = final hc_streams highway [block, hc_mult, hidden] FP32. Mirrors
+        // the reference drafter head (`dspark.py:781-995`): hc_head collapse →
+        // mtp.2.norm → shared lm_head logits → serial-Markov argmax loop → emit
+        // block position-0 token (K=1). Confidence (mtp.2.confidence_head) is
+        // computed for `last_confidence()` but is off the emit critical path
+        // (tau=0 default). The serial loop always runs all `block` positions;
+        // K=1 emits position 0 (`draft_token_ids[:, :1]`).
+        let vocab = ctx.config.vocab_size as u32;
+        let rank = ctx.config.dspark_markov_rank as u32;
+        let hc = self
+            .module
+            .hc_head
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DSpark last stage has no hc_head weights"))?;
+
+        let dense = gpu.alloc(hidden_bytes)?; // [block, hidden] BF16
+        let normed = gpu.alloc(hidden_bytes)?; // [block, hidden] BF16
+        let logits = gpu.alloc((block * vocab) as usize * 2)?; // [block, vocab] BF16
+        let mk_embed = gpu.alloc(rank as usize * 2)?; // [rank] BF16 (current prev embed)
+        let mk_embed0 = gpu.alloc(rank as usize * 2)?; // saved pos-0 embed for confidence
+        let mk_logits = gpu.alloc(vocab as usize * 2)?; // [vocab] BF16
+        let argmax_out = gpu.alloc(4)?; // u32 index
+        let feats = gpu.alloc((h as usize + rank as usize) * 2)?; // [hidden+rank] BF16 (confidence)
+        let conf_bf16 = gpu.alloc(2)?; // [1] BF16 pre-sigmoid
+
+        // 1. hc_head collapse: cur [block, hc_mult, hidden] FP32 → dense [block, hidden] BF16.
+        ops::hc_head(
+            gpu, self.hc_head_k, cur, hc.hc_fn, hc.hc_scale, hc.hc_base, dense, block, h, hc_mult,
+            eps, hc_eps, stream,
+        )?;
+        // 2. final norm (mtp.2.norm), per block token.
+        ops::rms_norm(gpu, self.rms_norm_k, dense, &self.module.norm, normed, block, h, eps, stream)?;
+        // 3. base logits: shared lm_head GEMV per block position → logits [block, vocab].
+        for p in 0..block as usize {
+            ops::dense_gemv(
+                gpu, self.dense_gemv_k, normed.offset(p * h as usize * 2), &self.lm_head,
+                logits.offset(p * vocab as usize * 2), vocab, h, stream,
+            )?;
+        }
+        // 4. serial-Markov argmax loop. Seed prev = anchor (last_token). For each
+        //    position p: markov_embed = markov_w1[prev]; logits[p] += markov_w2 @
+        //    markov_embed; next = argmax(logits[p]). K=1 emits position 0.
+        let mut prev = last_token;
+        let mut emit_token: Option<u32> = None;
+        for p in 0..block as usize {
+            gpu.copy_d2d_async(
+                self.module.markov_w1.weight.offset(prev as usize * rank as usize * 2),
+                mk_embed, rank as usize * 2, stream,
+            )?;
+            if p == 0 {
+                gpu.copy_d2d_async(mk_embed, mk_embed0, rank as usize * 2, stream)?;
+            }
+            ops::dense_gemv(gpu, self.dense_gemv_k, mk_embed, &self.module.markov_w2, mk_logits, vocab, rank, stream)?;
+            ops::residual_add(gpu, self.residual_add_k, logits.offset(p * vocab as usize * 2), mk_logits, vocab, stream)?;
+            ops::argmax_bf16(gpu, self.argmax_k, logits.offset(p * vocab as usize * 2), argmax_out, vocab, stream)?;
+            gpu.synchronize(stream)?;
+            let mut tb = [0u8; 4];
+            gpu.copy_d2h(argmax_out, &mut tb)?;
+            let tok = u32::from_le_bytes(tb);
+            if p == 0 {
+                emit_token = Some(tok);
+            }
+            prev = tok;
+        }
+        // 5. confidence for the emitted position 0: sigmoid(proj(cat(dense_0,
+        //    markov_embed_0))). Reported by `last_confidence()` (tau-gating only;
+        //    not on the emit path).
+        gpu.copy_d2d_async(dense, feats, h as usize * 2, stream)?;
+        gpu.copy_d2d_async(mk_embed0, feats.offset(h as usize * 2), rank as usize * 2, stream)?;
+        ops::dense_gemv(gpu, self.dense_gemv_k, feats, &self.module.confidence_proj, conf_bf16, 1, h + rank, stream)?;
+        gpu.synchronize(stream)?;
+        let mut cb = [0u8; 2];
+        gpu.copy_d2h(conf_bf16, &mut cb)?;
+        let conf_logit = f32::from_bits((u16::from_le_bytes(cb) as u32) << 16);
+        let conf = 1.0f32 / (1.0 + (-conf_logit).exp());
+        self.last_conf.store(conf.to_bits(), std::sync::atomic::Ordering::Relaxed);
+
         for p in [
             cur, nxt, x_embed, y_out, post, comb, norm_out, sublayer, block_pos_dev, main_pos_dev,
+            dense, normed, logits, mk_embed, mk_embed0, mk_logits, argmax_out, feats, conf_bf16,
         ] {
             gpu.free(p)?;
         }
-        Ok(())
+        Ok(emit_token)
     }
 
     /// Net-new DSpark stage attention (Increment B). Replaces the identity stub:
@@ -894,7 +980,8 @@ impl DraftProposer for DeepseekV4DSparkHead {
     /// runs inside the net-new stage forward; until that lands report `None` so
     /// callers do not gate.
     fn last_confidence(&self) -> Option<f32> {
-        None
+        let c = f32::from_bits(self.last_conf.load(std::sync::atomic::Ordering::Relaxed));
+        if c.is_nan() { None } else { Some(c) }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -980,25 +1067,22 @@ impl DraftProposer for DeepseekV4DSparkHead {
         // then `propose()` drafts nothing rather than silently substituting the
         // wrong (per-token MLA) attention, which would diverge on the
         // `stage_out` goldens.
-        // Increment A (dev/gate only): run the stage-forward plumbing skeleton
-        // (mHC + norm + reused MoE; attention STUBBED) to dump `stage_out` for
-        // the golden gate. Gated on `ATLAS_DSPARK_DUMP_DIR` so a normal serve is
-        // byte-neutral (still drafts nothing). Increment B replaces the stub with
-        // the net-new sparse-MLA attention and returns the K=1 draft token.
-        if have_main_x
-            && std::env::var("ATLAS_DSPARK_DUMP_DIR")
-                .map(|d| !d.is_empty())
-                .unwrap_or(false)
-        {
-            if let Err(e) = self.run_stage_forward_dev(_last_token, _position, main_x, ctx, stream) {
-                tracing::warn!("DSpark stage-forward failed: {e}");
+        // Full drafter forward (3 sparse-MLA stages + head) → K=1 proposal token.
+        // Needs the block input `main_x` from `project_main` above. Boundary dumps
+        // inside are env-gated (`ATLAS_DSPARK_DUMP_STAGE_BOUNDARIES`), so a normal
+        // serve runs the forward + emits pos-0 with no dumps. A forward error
+        // degrades to drafting nothing (verify then decodes serially).
+        if !have_main_x {
+            return Ok(Vec::new());
+        }
+        match self.run_stage_forward_dev(_last_token, _position, main_x, ctx, stream) {
+            Ok(Some(tok)) => Ok(vec![tok]),
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => {
+                tracing::warn!("DSpark drafter forward failed: {e} — drafting none");
+                Ok(Vec::new())
             }
         }
-        tracing::debug!(
-            "DSpark propose: semi-AR block forward (sparse-MLA stages) is the net-new \
-             kernel boundary — drafting none pending the GPU-convergence lane"
-        );
-        Ok(Vec::new())
     }
 
     fn after_verify(
