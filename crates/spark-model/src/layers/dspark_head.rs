@@ -165,6 +165,119 @@ impl ProposerState for DeepseekV4DSparkProposerState {
 
 /// DeepSeek-V4 native DSpark draft proposer (K=1).
 #[allow(dead_code)]
+/// Pre-allocated persistent scratch for the native DSpark drafter forward. All
+/// buffers are sized at construction to the fixed K=1/block shapes and reused
+/// across every `propose()` — so the drafter propose→emit path performs ZERO
+/// `gpu.alloc`/`gpu.free` (the alloc/free churn interacts with the captured K2
+/// verify CUDA graph's memory). Freed once in `Drop`. Sizes mirror the former
+/// per-call allocations exactly, so numerics are byte-identical.
+struct DsparkScratch {
+    // run_stage_forward_dev highway + stage buffers
+    cur: DevicePtr,
+    nxt: DevicePtr,
+    x_embed: DevicePtr,
+    y_out: DevicePtr,
+    post: DevicePtr,
+    comb: DevicePtr,
+    norm_out: DevicePtr,
+    sublayer: DevicePtr,
+    block_pos: DevicePtr,
+    main_pos: DevicePtr,
+    // head path
+    dense: DevicePtr,
+    normed: DevicePtr,
+    logits: DevicePtr,
+    mk_embed: DevicePtr,
+    mk_embed0: DevicePtr,
+    mk_logits: DevicePtr,
+    argmax_out: DevicePtr,
+    feats: DevicePtr,
+    conf_bf16: DevicePtr,
+    // stage_attn
+    qra: DevicePtr,
+    qra_n: DevicePtr,
+    q: DevicePtr,
+    q_n: DevicePtr,
+    kv: DevicePtr,
+    kv_n: DevicePtr,
+    rope_tmp: DevicePtr,
+    attn_out: DevicePtr,
+    o_latent: DevicePtr,
+    o_out: DevicePtr,
+    mkv: DevicePtr,
+    mkv_n: DevicePtr,
+    valid_dev: DevicePtr,
+}
+
+impl DsparkScratch {
+    fn new(
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+        nq: u32,
+        o_groups: u32,
+    ) -> Result<Self> {
+        let h = config.hidden_size;
+        let block = config.dspark_block_size.max(1);
+        let hc = config.hc_mult;
+        let vocab = config.vocab_size;
+        let rank = config.dspark_markov_rank;
+        let hd = config.head_dim;
+        let q_lora = config.q_lora_rank;
+        let o_lora = config.o_lora_rank;
+        let rope = config.qk_rope_head_dim;
+        let nq = nq as usize;
+        let latent = o_groups as usize * o_lora;
+        Ok(Self {
+            cur: gpu.alloc(block * hc * h * 4)?,
+            nxt: gpu.alloc(block * hc * h * 4)?,
+            x_embed: gpu.alloc(block * h * 2)?,
+            y_out: gpu.alloc(block * h * 2)?,
+            post: gpu.alloc(block * hc * 4)?,
+            comb: gpu.alloc(block * hc * hc * 4)?,
+            norm_out: gpu.alloc(block * h * 2)?,
+            sublayer: gpu.alloc(block * h * 2)?,
+            block_pos: gpu.alloc(block * 4)?,
+            main_pos: gpu.alloc(4)?,
+            dense: gpu.alloc(block * h * 2)?,
+            normed: gpu.alloc(block * h * 2)?,
+            logits: gpu.alloc(block * vocab * 2)?,
+            mk_embed: gpu.alloc(rank * 2)?,
+            mk_embed0: gpu.alloc(rank * 2)?,
+            mk_logits: gpu.alloc(vocab * 2)?,
+            argmax_out: gpu.alloc(4)?,
+            feats: gpu.alloc((h + rank) * 2)?,
+            conf_bf16: gpu.alloc(2)?,
+            qra: gpu.alloc(block * q_lora * 2)?,
+            qra_n: gpu.alloc(block * q_lora * 2)?,
+            q: gpu.alloc(block * nq * hd * 2)?,
+            q_n: gpu.alloc(block * nq * hd * 2)?,
+            kv: gpu.alloc(block * hd * 2)?,
+            kv_n: gpu.alloc(block * hd * 2)?,
+            rope_tmp: gpu.alloc(block * nq * rope * 2)?,
+            attn_out: gpu.alloc(block * nq * hd * 2)?,
+            o_latent: gpu.alloc(block * latent * 2)?,
+            o_out: gpu.alloc(block * h * 2)?,
+            mkv: gpu.alloc(hd * 2)?,
+            mkv_n: gpu.alloc(hd * 2)?,
+            valid_dev: gpu.alloc(4)?,
+        })
+    }
+
+    #[allow(dead_code)] // process-lifetime scratch; freed at shutdown (no Drop gpu handle)
+    fn free(&self, gpu: &dyn GpuBackend) {
+        for p in [
+            self.cur, self.nxt, self.x_embed, self.y_out, self.post, self.comb, self.norm_out,
+            self.sublayer, self.block_pos, self.main_pos, self.dense, self.normed, self.logits,
+            self.mk_embed, self.mk_embed0, self.mk_logits, self.argmax_out, self.feats,
+            self.conf_bf16, self.qra, self.qra_n, self.q, self.q_n, self.kv, self.kv_n,
+            self.rope_tmp, self.attn_out, self.o_latent, self.o_out, self.mkv, self.mkv_n,
+            self.valid_dev,
+        ] {
+            let _ = gpu.free(p);
+        }
+    }
+}
+
 pub struct DeepseekV4DSparkHead {
     /// The loaded native DSpark module: 3 reused V4 stage bodies + DSpark heads
     /// (`main_proj`/`main_norm`, final norm, serial Markov head, confidence
@@ -175,7 +288,10 @@ pub struct DeepseekV4DSparkHead {
     /// Shared LM head (BF16), from the target model. Every draft is re-verified
     /// by the target's head, so the draft head only affects acceptance.
     lm_head: DenseWeight,
-    /// Reduced vocab size for the draft LM-head GEMV (0 = full vocab).
+    /// Reduced vocab size for the draft LM-head GEMV (0 = full vocab). Currently
+    /// the head drafts over full `config.vocab_size` (reference parity); retained
+    /// for a future reduced-vocab draft path.
+    #[allow(dead_code)]
     mtp_vocab_size: u32,
     /// Number of draft stages (`n_mtp_layers`, = `module.stages.len()`).
     num_stages: usize,
@@ -206,6 +322,8 @@ pub struct DeepseekV4DSparkHead {
     /// removes ALL aliasing with the verify graph's buffers (the illegal-address
     /// crash) without touching the shared MoE or the K2 verify. Block-sized.
     drafter_arena: spark_runtime::buffers::BufferArena,
+    /// Pre-allocated persistent scratch — zero alloc/free in the propose path.
+    scratch: DsparkScratch,
 
     // Kernel handles (mirrors `DeepseekV4MtpHead`).
     rms_norm_k: KernelHandle,
@@ -304,6 +422,7 @@ impl DeepseekV4DSparkHead {
             16,
             gpu,
         )?;
+        let scratch = DsparkScratch::new(gpu, config, drafter_nq, drafter_o_groups)?;
 
         Ok(Self {
             module,
@@ -317,6 +436,7 @@ impl DeepseekV4DSparkHead {
             drafter_nq,
             drafter_o_groups,
             drafter_arena,
+            scratch,
             // V4 ships HF-vanilla norm weights (norms are loaded exactly) — the
             // offset-from-1 kernel would apply `1 + w`.
             rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
@@ -480,17 +600,18 @@ impl DeepseekV4DSparkHead {
         let sinkhorn = hc0.sinkhorn_iters as u32;
         let hc_eps = hc0.hc_eps;
 
-        // Per-call scratch (correctness-first; a batched/stateful profile pools these).
-        let hidden_bytes = (block * h) as usize * 2; // BF16 [block, hidden]
-        let stream_bytes = (block * hc_mult * h) as usize * 4; // FP32 [block, hc_mult, hidden]
-        let mut cur = gpu.alloc(stream_bytes)?; // FP32 highway (ping)
-        let mut nxt = gpu.alloc(stream_bytes)?; // FP32 highway (pong)
-        let x_embed = gpu.alloc(hidden_bytes)?;
-        let y_out = gpu.alloc(hidden_bytes)?; // hc_pre collapsed (BF16)
-        let post = gpu.alloc((block * hc_mult) as usize * 4)?; // FP32
-        let comb = gpu.alloc((block * hc_mult * hc_mult) as usize * 4)?; // FP32
-        let norm_out = gpu.alloc(hidden_bytes)?; // rms_norm out / MoE in-place (BF16)
-        let sublayer = gpu.alloc(hidden_bytes)?; // attn output (BF16)
+        // Persistent pre-allocated scratch (zero alloc/free in propose). `cur`/`nxt`
+        // are DevicePtr (Copy), so the ping-pong `std::mem::swap` swaps the local
+        // pointers, not the owned buffers.
+        let s = &self.scratch;
+        let mut cur = s.cur; // FP32 highway (ping)
+        let mut nxt = s.nxt; // FP32 highway (pong)
+        let x_embed = s.x_embed;
+        let y_out = s.y_out; // hc_pre collapsed (BF16)
+        let post = s.post; // FP32
+        let comb = s.comb; // FP32
+        let norm_out = s.norm_out; // rms_norm out / MoE in-place (BF16)
+        let sublayer = s.sublayer; // attn output (BF16)
 
         // Noise block embed: [anchor=last_token, noise×(block-1)] → x_embed [block, hidden].
         // Diagnostic (default OFF): route-B pins the block ANCHOR (row 0) to the
@@ -523,9 +644,9 @@ impl DeepseekV4DSparkHead {
         let block_pos_host: Vec<u8> = (0..block)
             .flat_map(|t| (position as u32 + t).to_le_bytes())
             .collect();
-        let block_pos_dev = gpu.alloc(block as usize * 4)?;
+        let block_pos_dev = s.block_pos;
         gpu.copy_h2d(&block_pos_host, block_pos_dev)?;
-        let main_pos_dev = gpu.alloc(4)?;
+        let main_pos_dev = s.main_pos;
         gpu.copy_h2d(&(position as u32).to_le_bytes(), main_pos_dev)?;
 
         for (i, l) in bodies.iter().enumerate() {
@@ -607,15 +728,15 @@ impl DeepseekV4DSparkHead {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("DSpark last stage has no hc_head weights"))?;
 
-        let dense = gpu.alloc(hidden_bytes)?; // [block, hidden] BF16
-        let normed = gpu.alloc(hidden_bytes)?; // [block, hidden] BF16
-        let logits = gpu.alloc((block * vocab) as usize * 2)?; // [block, vocab] BF16
-        let mk_embed = gpu.alloc(rank as usize * 2)?; // [rank] BF16 (current prev embed)
-        let mk_embed0 = gpu.alloc(rank as usize * 2)?; // saved pos-0 embed for confidence
-        let mk_logits = gpu.alloc(vocab as usize * 2)?; // [vocab] BF16
-        let argmax_out = gpu.alloc(4)?; // u32 index
-        let feats = gpu.alloc((h as usize + rank as usize) * 2)?; // [hidden+rank] BF16 (confidence)
-        let conf_bf16 = gpu.alloc(2)?; // [1] BF16 pre-sigmoid
+        let dense = s.dense; // [block, hidden] BF16
+        let normed = s.normed; // [block, hidden] BF16
+        let logits = s.logits; // [block, vocab] BF16
+        let mk_embed = s.mk_embed; // [rank] BF16 (current prev embed)
+        let mk_embed0 = s.mk_embed0; // saved pos-0 embed for confidence
+        let mk_logits = s.mk_logits; // [vocab] BF16
+        let argmax_out = s.argmax_out; // u32 index
+        let feats = s.feats; // [hidden+rank] BF16 (confidence)
+        let conf_bf16 = s.conf_bf16; // [1] BF16 pre-sigmoid
 
         // 1. hc_head collapse: cur [block, hc_mult, hidden] FP32 → dense [block, hidden] BF16.
         ops::hc_head(
@@ -669,12 +790,7 @@ impl DeepseekV4DSparkHead {
         let conf = 1.0f32 / (1.0 + (-conf_logit).exp());
         self.last_conf.store(conf.to_bits(), std::sync::atomic::Ordering::Relaxed);
 
-        for p in [
-            cur, nxt, x_embed, y_out, post, comb, norm_out, sublayer, block_pos_dev, main_pos_dev,
-            dense, normed, logits, mk_embed, mk_embed0, mk_logits, argmax_out, feats, conf_bf16,
-        ] {
-            gpu.free(p)?;
-        }
+        // Scratch is persistent (self.scratch) — no per-call free.
         Ok(emit_token)
     }
 
@@ -729,21 +845,22 @@ impl DeepseekV4DSparkHead {
         let group_in = (nq * hd) / o_groups;
         let latent_dim = o_groups * o_lora;
 
-        // ── scratch (per-call; correctness-first) ──
+        // ── scratch (persistent, from self.scratch — zero alloc/free) ──
         let b = block as usize;
-        let qra = gpu.alloc(b * q_lora as usize * 2)?;
-        let qra_n = gpu.alloc(b * q_lora as usize * 2)?;
-        let q = gpu.alloc(b * (nq * hd) as usize * 2)?;
-        let q_n = gpu.alloc(b * (nq * hd) as usize * 2)?;
-        let kv = gpu.alloc(b * hd as usize * 2)?; // draft_kv (per block token)
-        let kv_n = gpu.alloc(b * hd as usize * 2)?;
-        let rope_tmp = gpu.alloc(b * (nq * rope) as usize * 2)?; // ≥ block*rope for kv too
-        let attn_out = gpu.alloc(b * (nq * hd) as usize * 2)?;
-        let o_latent = gpu.alloc(b * latent_dim as usize * 2)?;
-        let o_out = gpu.alloc(b * h as usize * 2)?;
-        let mkv = gpu.alloc(hd as usize * 2)?; // main-KV projection
-        let mkv_n = gpu.alloc(hd as usize * 2)?;
-        let valid_dev = gpu.alloc(4)?;
+        let s = &self.scratch;
+        let qra = s.qra;
+        let qra_n = s.qra_n;
+        let q = s.q;
+        let q_n = s.q_n;
+        let kv = s.kv; // draft_kv (per block token)
+        let kv_n = s.kv_n;
+        let rope_tmp = s.rope_tmp; // ≥ block*rope for kv too
+        let attn_out = s.attn_out;
+        let o_latent = s.o_latent;
+        let o_out = s.o_out;
+        let mkv = s.mkv; // main-KV projection
+        let mkv_n = s.mkv_n;
+        let valid_dev = s.valid_dev;
         gpu.copy_h2d(&valid_main_len.to_le_bytes(), valid_dev)?;
 
         let row_h = h as usize * 2;
@@ -840,11 +957,7 @@ impl DeepseekV4DSparkHead {
         }
         gpu.copy_d2d_async(o_out, out, b * row_h, stream)?;
 
-        for p in [
-            qra, qra_n, q, q_n, kv, kv_n, rope_tmp, attn_out, o_latent, o_out, mkv, mkv_n, valid_dev,
-        ] {
-            gpu.free(p)?;
-        }
+        // Scratch is persistent (self.scratch) — no per-call free.
         Ok(())
     }
 
