@@ -190,6 +190,14 @@ pub struct DeepseekV4DSparkHead {
     /// process-lifetime; the per-sequence write position is on the state.
     /// Empty when `dspark_window_size == 0` (mis-config guard).
     main_kv_caches: Vec<DsparkMainKvCache>,
+    /// Fix B: full (un-sharded) drafter head count `nq` and O-projection group
+    /// count `o_groups`. The drafter runs rank-0-complete (its MLA weights are
+    /// loaded un-sharded via `drafter_stage_config`), so the stage forward uses
+    /// the FULL counts (`local * tp`, = 64 / 8 at TP=2) — NOT the TP-local
+    /// `config.num_attention_heads` / `config.o_groups` the target model uses —
+    /// and issues no wo_b all-reduce.
+    drafter_nq: u32,
+    drafter_o_groups: u32,
 
     // Kernel handles (mirrors `DeepseekV4MtpHead`).
     rms_norm_k: KernelHandle,
@@ -270,6 +278,10 @@ impl DeepseekV4DSparkHead {
             );
         }
 
+        // Fix B: rank-0-complete drafter → full (un-sharded) head/group counts.
+        let (drafter_nq, drafter_o_groups) =
+            crate::weight_loader::deepseek_v4::dspark::drafter_head_counts(config);
+
         Ok(Self {
             module,
             embed_tokens,
@@ -279,6 +291,8 @@ impl DeepseekV4DSparkHead {
             block_size: config.dspark_block_size.max(1),
             noise_token_id: config.dspark_noise_token_id,
             main_kv_caches,
+            drafter_nq,
+            drafter_o_groups,
             // V4 ships HF-vanilla norm weights (norms are loaded exactly) — the
             // offset-from-1 kernel would apply `1 + w`.
             rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
@@ -582,13 +596,13 @@ impl DeepseekV4DSparkHead {
         let h = ctx.config.hidden_size as u32;
         let block = self.block_size as u32;
         let eps = ctx.config.rms_norm_eps as f32;
-        // `num_attention_heads` is already TP-local (see the "TP-local head counts"
-        // topology log and `qwen3_attention/prefill_weights.rs`: `nq =
-        // config.num_attention_heads`). The drafter MLA assembles to `local nq=32`
-        // (wq_b [32768,1024]→col). Dividing by `tp` again halved the drafter to 16
-        // heads → Q shape [block,16,512] vs reference [block,32,512] → wrong Q →
-        // downstream cos≈0. Use the config value directly.
-        let nq = ctx.config.num_attention_heads as u32; // already TP-local (n_local_heads)
+        // Fix B: rank-0-complete drafter uses the FULL (un-sharded) head/group
+        // counts (`local * tp`, = 64 / 8 at TP=2), because the drafter MLA
+        // weights are loaded un-sharded on rank 0 (`drafter_stage_config`). The
+        // target model's TP-local `ctx.config.num_attention_heads` (= 32) would
+        // read only half the un-sharded wq_b → wrong Q. `drafter_nq` is set in
+        // `new()` from `drafter_head_counts(config)`.
+        let nq = self.drafter_nq; // full drafter head count (un-sharded)
         let q_lora = mla.q_lora_rank as u32;
         let o_lora = mla.o_lora_rank as u32;
         let rope = mla.rope as u32;
@@ -596,7 +610,7 @@ impl DeepseekV4DSparkHead {
         let nope = mla.nope as u32; // qk_nope_head_dim (= 448); rope lanes are the trailing `rope`
         let window = ring.window as u32;
         let scale = (hd as f32).powf(-0.5);
-        let o_groups = ctx.config.o_groups.max(1) as u32;
+        let o_groups = self.drafter_o_groups.max(1); // full drafter O-proj groups (un-sharded)
         let group_in = (nq * hd) / o_groups;
         let latent_dim = o_groups * o_lora;
 
@@ -698,13 +712,14 @@ impl DeepseekV4DSparkHead {
         if dump_bd {
             self.dump_boundary(ctx, o_latent, "b07_oproj_wo_a", stage_idx, block, latent_dim, stream)?;
         }
-        // ── TP all-reduce (wo_b is row-parallel) ──
-        if ctx.config.tp_world_size > 1
-            && let Some(comm) = ctx.comm
-        {
-            comm.all_reduce_async(o_out.0, (block * h) as usize * 2, stream)?;
-        }
-        // B08: O-projection output AFTER TP all-reduce BF16 [block, hidden].
+        // ── Fix B: NO TP all-reduce ──
+        // The drafter is rank-0-complete: its wo_b is loaded UN-SHARDED (full
+        // o_latent input), so this per-token wo_b GEMV already produces the
+        // COMPLETE O-projection on rank 0. There is no row-parallel partial to
+        // reduce (and no peer rank running the drafter to reduce with). The
+        // former `ctx.comm` all-reduce here was dead code on the `comm: None`
+        // propose path and is removed — o_out below is the full result.
+        // B08: complete O-projection output BF16 [block, hidden].
         if dump_bd {
             self.dump_boundary(ctx, o_out, "b08_oproj_postred", stage_idx, block, h, stream)?;
         }

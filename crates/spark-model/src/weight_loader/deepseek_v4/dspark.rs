@@ -47,6 +47,55 @@ use crate::weight_map::{DenseWeight, dense_auto};
 /// Number of native DSpark draft stages (`n_mtp_layers = 3`).
 const NUM_DSPARK_STAGES: usize = 3;
 
+/// Fix B (2026-07-28): the native DSpark drafter runs **rank-0-complete** — the
+/// whole drafter forward executes only on rank 0 (`comm: None`, mirroring the
+/// MTP design), so its TP-sharded MLA (wq_b col / wo_a col / wo_b row) would
+/// leave rank 0 with only half the O-projection and no peer to all-reduce with
+/// (the collective is dead code on the `comm: None` propose path). Instead we
+/// load the drafter's MLA weights **un-sharded** on rank 0 and drop the reduce.
+///
+/// `drafter_stage_config` returns the config the drafter STAGES are assembled
+/// with: identical to the model config except `tp_world_size = 1` / `tp_rank =
+/// 0`, which makes [`super::assemble::assemble_layer`] skip its MLA TP-shard
+/// block (the only tp-dependent MLA path there) and keep the full checkpoint
+/// tensors. The TARGET model config is untouched, so target weights stay
+/// TP-sharded. See memory `dspark-k1-fixb-rank0-complete`.
+pub(crate) fn drafter_stage_config(config: &ModelConfig) -> ModelConfig {
+    let mut c = config.clone();
+    // Fix B invariant: drafter assembles un-sharded (view=1); target keeps its tp.
+    c.tp_world_size = drafter_vs_target_tp(config.tp_world_size).0;
+    c.tp_rank = 0;
+    c
+}
+
+/// The tp view the drafter STAGES assemble with, paired with the target model's
+/// tp. Fix B: the drafter is always un-sharded (view = `1` → no MLA shard, no
+/// wo_b all-reduce), while the target keeps its own `tp` (stays TP-sharded).
+/// Pure so the un-shard invariant is unit-testable without a full `ModelConfig`.
+pub(crate) fn drafter_vs_target_tp(target_tp: usize) -> (usize, usize) {
+    (1, target_tp.max(1))
+}
+
+/// Full (un-sharded) drafter head count and O-projection group count used by the
+/// rank-0-complete stage forward. The model config carries the TP-LOCAL values
+/// (`num_attention_heads` / `o_groups` already divided by `tp_world_size`), so
+/// the drafter's complete counts are `local * tp`. For a TP=2 serve this is
+/// `nq = 32*2 = 64`, `o_groups = 4*2 = 8`.
+pub(crate) fn drafter_head_counts(config: &ModelConfig) -> (u32, u32) {
+    drafter_head_counts_inner(
+        config.num_attention_heads,
+        config.o_groups,
+        config.tp_world_size,
+    )
+}
+
+/// Pure arithmetic for [`drafter_head_counts`] (full = TP-local * tp), split out
+/// for unit-testing without constructing a `ModelConfig`.
+fn drafter_head_counts_inner(nq_local: usize, o_groups_local: usize, tp: usize) -> (u32, u32) {
+    let tp = tp.max(1) as u32;
+    (nq_local as u32 * tp, o_groups_local.max(1) as u32 * tp)
+}
+
 /// A loaded DeepSeek-V4 **native DSpark** drafter: the 3 reused V4 transformer
 /// stages plus the DSpark-specific input projection (`main_proj`/`main_norm`),
 /// final norm, serial Markov head (`markov_w1`/`markov_w2`), and confidence head.
@@ -135,6 +184,13 @@ pub fn load_v4_dspark_module(
     let mut stages: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(NUM_DSPARK_STAGES);
     let mut last_hc_head: Option<HcHeadWeights> = None;
 
+    // Fix B: assemble the drafter stages with a tp_world_size=1 view so their
+    // MLA weights (wq_b/wo_a/wo_b/attn_sink) stay un-sharded on rank 0 (the
+    // rank-0-complete drafter needs the full O-projection, no all-reduce). The
+    // target model keeps `config` (TP-sharded). All non-MLA-shard uses of the
+    // config (dims, MoE, mHC) are tp-independent, so this only lifts the shard.
+    let drafter_cfg = drafter_stage_config(config);
+
     for i in 0..NUM_DSPARK_STAGES {
         let prefix = format!("mtp.{i}");
         let ap = format!("{prefix}.attn");
@@ -206,7 +262,7 @@ pub fn load_v4_dspark_module(
             wo_a,
             hc_head.clone(),
             store,
-            config,
+            &drafter_cfg, // Fix B: tp=1 view → un-sharded drafter MLA on rank 0
             gpu,
             layer_kv_dtypes,
         )?;
@@ -268,7 +324,30 @@ pub fn load_v4_dspark_module(
 
 #[cfg(test)]
 mod tests {
-    use super::dspark_present;
+    use super::{dspark_present, drafter_head_counts_inner, drafter_vs_target_tp};
+
+    // Fix B: the native DSpark drafter is rank-0-complete — its stages assemble
+    // UN-SHARDED (tp view = 1 → no MLA shard, no wo_b all-reduce), while the
+    // TARGET model keeps its own tp (stays TP-sharded). This proves the two
+    // required invariants at the config level: target weights remain sharded,
+    // drafter weights are complete on rank 0, and the drafter issues no reduce
+    // (the reduce path is gated `tp_world_size > 1`, and the drafter view is 1).
+    #[test]
+    fn drafter_unsharded_target_stays_sharded() {
+        assert_eq!(drafter_vs_target_tp(2), (1, 2), "drafter tp=1 (un-sharded); target tp=2 (sharded)");
+        assert_eq!(drafter_vs_target_tp(4), (1, 4));
+        assert_eq!(drafter_vs_target_tp(1), (1, 1), "TP=1 serve: drafter + target both un-sharded");
+    }
+
+    // Fix B: drafter head/group counts are the FULL (un-sharded) counts =
+    // TP-local * tp. At TP=2 the checkpoint's 64 heads / 8 O-groups are stored
+    // as local (32 / 4); the rank-0-complete drafter must use the full 64 / 8.
+    #[test]
+    fn drafter_head_counts_are_full_unsharded() {
+        assert_eq!(drafter_head_counts_inner(32, 4, 2), (64, 8), "nq=64, o_groups=8 at TP=2");
+        assert_eq!(drafter_head_counts_inner(32, 4, 1), (32, 4), "TP=1: local == full");
+        assert_eq!(drafter_head_counts_inner(16, 2, 4), (64, 8), "full = local*tp");
+    }
 
     // Detection key: native DSpark loads iff MTP is enabled AND the checkpoint
     // ships `mtp.0.main_proj` (distinct from the NVIDIA-style `mtp.0.enorm`).
