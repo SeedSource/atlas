@@ -451,6 +451,12 @@ impl DeepseekV4DSparkHead {
         // hc_expand: x_embed → cur [block, hc_mult, hidden] FP32.
         ops::hc_expand(gpu, self.hc_expand_k, x_embed, cur, block, h, hc_mult, stream)?;
 
+        // Route-B: force the decode position to the injected step (so valid-len /
+        // slot / block positions match the golden matched-pair). No-op unless set.
+        let position = std::env::var("ATLAS_DSPARK_INJECT_POSITION")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(position);
         // Block draft positions = main_pos + [0..block); main-KV store slot/valid-len.
         let window = self.main_kv_caches[0].window;
         let main_slot = position % window;
@@ -471,10 +477,13 @@ impl DeepseekV4DSparkHead {
                 post, comb, block, h, hc_mult, sinkhorn, eps, hc_eps, stream,
             )?;
             ops::rms_norm(gpu, self.rms_norm_k, y_out, l.dspark_attn_norm(), norm_out, block, h, eps, stream)?;
+            // Route-B: inject the golden post-store ring for this stage (→ skip the
+            // in-kernel store so the injected ring is authoritative). No-op OFF.
+            let skip_store = self.maybe_inject_ring(i, ctx)?;
             // Net-new sparse-MLA stage attention (Increment B).
             self.stage_attn(
                 *l, norm_out, main_x, block_pos_dev, main_pos_dev, valid_main_len,
-                &self.main_kv_caches[i], main_slot, sublayer, ctx, stream,
+                &self.main_kv_caches[i], main_slot, skip_store, sublayer, ctx, stream,
             )?;
             ops::hc_post(gpu, self.hc_post_k, sublayer, cur, post, comb, nxt, block, h, hc_mult, stream)?;
             std::mem::swap(&mut cur, &mut nxt);
@@ -517,6 +526,7 @@ impl DeepseekV4DSparkHead {
         valid_main_len: i32,
         ring: &DsparkMainKvCache,
         main_slot: usize,
+        skip_store: bool,
         out: DevicePtr,
         ctx: &ForwardContext,
         stream: u64,
@@ -584,12 +594,16 @@ impl DeepseekV4DSparkHead {
         ops::mla_q_rope_writeback_batched(gpu, self.mla_q_rope_writeback_batched_k, rope_tmp, kv_n, block, 1, hd, nope, rope, hd, stream)?;
 
         // ── store_main_kv: project main_x → kv_norm → rope(main_pos) → ring slot ──
-        ops::dense_gemv(gpu, self.dense_gemv_k, main_x, &mla.wkv_a, mkv, hd, h, stream)?;
-        ops::rms_norm(gpu, self.rms_norm_k, mkv, &mla.kv_a_norm, mkv_n, 1, hd, eps, stream)?;
-        ops::mla_q_rope_extract_batched(gpu, self.mla_q_rope_extract_batched_k, mkv_n, rope_tmp, 1, 1, hd, nope, rope, hd, stream)?;
-        ops::rope_yarn(gpu, self.rope_fwd_k, rope_tmp, rope_tmp, main_pos_dev, 1, 1, 0, rope, rope, mla.main_inv_freq, 1.0, stream)?;
-        ops::mla_q_rope_writeback_batched(gpu, self.mla_q_rope_writeback_batched_k, rope_tmp, mkv_n, 1, 1, hd, nope, rope, hd, stream)?;
-        gpu.copy_d2d_async(mkv_n, ring.buf.offset(main_slot * hd as usize * 2), hd as usize * 2, stream)?;
+        // Skipped under route-B ring injection (the injected ring is the exact
+        // reference post-store state; re-storing would overwrite slot main_slot).
+        if !skip_store {
+            ops::dense_gemv(gpu, self.dense_gemv_k, main_x, &mla.wkv_a, mkv, hd, h, stream)?;
+            ops::rms_norm(gpu, self.rms_norm_k, mkv, &mla.kv_a_norm, mkv_n, 1, hd, eps, stream)?;
+            ops::mla_q_rope_extract_batched(gpu, self.mla_q_rope_extract_batched_k, mkv_n, rope_tmp, 1, 1, hd, nope, rope, hd, stream)?;
+            ops::rope_yarn(gpu, self.rope_fwd_k, rope_tmp, rope_tmp, main_pos_dev, 1, 1, 0, rope, rope, mla.main_inv_freq, 1.0, stream)?;
+            ops::mla_q_rope_writeback_batched(gpu, self.mla_q_rope_writeback_batched_k, rope_tmp, mkv_n, 1, 1, hd, nope, rope, hd, stream)?;
+            gpu.copy_d2d_async(mkv_n, ring.buf.offset(main_slot * hd as usize * 2), hd as usize * 2, stream)?;
+        }
 
         // ── sparse windowed-MLA attention (net-new kernel) ──
         ops::dspark_sparse_attention(gpu, self.dspark_attn_k, q_n, kv_n, ring.buf, valid_dev, mla.attn_sink, attn_out, scale, 1, block, nq, hd, window, stream)?;
@@ -731,6 +745,44 @@ impl DeepseekV4DSparkHead {
             stack_in
         );
         Ok(Some(buf))
+    }
+
+    /// Route-B ring injection (DIAGNOSTIC, default OFF). When
+    /// `ATLAS_DSPARK_INJECT_RING_DIR` is a dir containing `r0_ring_stage{i}.bin`
+    /// (raw little-endian BF16, logical `[max_seqs, window, head_dim]` = the
+    /// reference post-store ring), load stage `i`'s ring into
+    /// `main_kv_caches[i].buf` and return `true` so the caller SKIPS the in-kernel
+    /// `store_main_kv` (the injected ring is the authoritative attended state).
+    /// Validates the exact byte count; fails loudly on mismatch. `false` (no
+    /// injection) unless the env is set.
+    fn maybe_inject_ring(&self, stage_idx: usize, ctx: &ForwardContext) -> Result<bool> {
+        let Ok(dir) = std::env::var("ATLAS_DSPARK_INJECT_RING_DIR") else {
+            return Ok(false);
+        };
+        if dir.is_empty() {
+            return Ok(false);
+        }
+        let ring = &self.main_kv_caches[stage_idx];
+        let path = format!("{dir}/r0_ring_stage{stage_idx}.bin");
+        let bytes =
+            std::fs::read(&path).map_err(|e| anyhow::anyhow!("DSPARK RING INJECT: read {path}: {e}"))?;
+        if bytes.len() != ring.bytes {
+            anyhow::bail!(
+                "DSPARK RING INJECT: {path} is {} bytes, expected {} ([{}, {}, {}] BF16) — \
+                 wrong shape/dtype, refusing to inject.",
+                bytes.len(),
+                ring.bytes,
+                ring.max_seqs,
+                ring.window,
+                ring.head_dim
+            );
+        }
+        ctx.gpu.copy_h2d(&bytes, ring.buf)?;
+        tracing::warn!(
+            "DSPARK RING INJECT ACTIVE (DIAGNOSTIC) stage {stage_idx} ← {path} ({} bytes)",
+            bytes.len()
+        );
+        Ok(true)
     }
 }
 
