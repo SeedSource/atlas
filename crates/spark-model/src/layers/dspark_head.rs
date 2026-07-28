@@ -541,7 +541,15 @@ impl DeepseekV4DSparkHead {
                 self.dump_boundary(ctx, norm_out, "b10_ffn_norm", i, block, h, stream)?;
             }
             l.dspark_ffn().forward_prefill(norm_out, block as usize, ctx, stream)?;
-            // B11: MoE output (BF16 [block, hidden], in-place in norm_out).
+            // `forward_prefill` READS its input buffer and WRITES the routed+shared
+            // result to `ctx.buffers.moe_output()` — it does NOT update `norm_out`
+            // in place (the shared-codebase contract; see moe/forward_prefill.rs).
+            // Copy the real MoE output back into `norm_out` so the b11 dump and the
+            // terminating `hc_post` consume it. Without this the entire MoE
+            // contribution is orphaned in moe_output() and hc_post folds the stale
+            // ffn-norm (b11 == b10 byte-identical, cos 0.067). [block, hidden] BF16.
+            gpu.copy_d2d_async(ctx.buffers.moe_output(), norm_out, (block * h) as usize * 2, stream)?;
+            // B11: MoE output (BF16 [block, hidden], now resident in norm_out).
             if dump_bd {
                 self.dump_boundary(ctx, norm_out, "b11_moe_out", i, block, h, stream)?;
             }
