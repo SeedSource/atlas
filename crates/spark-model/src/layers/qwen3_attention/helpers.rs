@@ -38,6 +38,27 @@ impl Qwen3AttentionLayer {
         self.mla = Some(mla);
     }
 
+    // ── Native DSpark drafter reuse accessors (read-only) ──
+    // The DSpark K=1 drafter (`layers::dspark_head`) replicates the stage
+    // forward with a net-new sparse-MLA attention, reusing the already-built /
+    // sharded MoE + norms of this stage body. `mla`/`hc`/`attn` are already
+    // `pub(crate)`; these expose the three `pub(super)` fields the head also
+    // needs. Read-only — they do not touch the decode path.
+    #[allow(dead_code)] // consumed by the DSpark stage forward (same lane, next commit)
+    pub(crate) fn dspark_ffn(&self) -> &FfnComponent {
+        &self.ffn
+    }
+    /// Attention input RMSNorm weight (`attn_norm`).
+    #[allow(dead_code)] // consumed by the DSpark stage forward (same lane, next commit)
+    pub(crate) fn dspark_attn_norm(&self) -> &DenseWeight {
+        &self.input_norm
+    }
+    /// Post-attention / FFN input RMSNorm weight (`ffn_norm`).
+    #[allow(dead_code)] // consumed by the DSpark stage forward (same lane, next commit)
+    pub(crate) fn dspark_ffn_norm(&self) -> &DenseWeight {
+        &self.post_attn_norm
+    }
+
     /// Set per-block Manifold-Constrained Hyper-Connection weights
     /// (DeepSeek-V4). When set, the attn/ffn residual sites route through
     /// `hc_pre`/`hc_post` against the model-level `hc_streams` buffer.

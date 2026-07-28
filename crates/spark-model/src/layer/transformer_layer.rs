@@ -18,6 +18,14 @@ pub trait TransformerLayer: Send + Sync {
         None
     }
 
+    /// `&dyn Any` immutable downcast hook. Default `None`. The native DSpark
+    /// drafter overrides this on `Qwen3AttentionLayer` so its net-new sparse-MLA
+    /// stage forward can read the already-assembled/sharded MLA + mHC + MoE
+    /// weights of the reused stage body (read-only; no decode-path change).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Decode one token through this layer, modifying `hidden` in-place.
     ///
     /// # Arguments

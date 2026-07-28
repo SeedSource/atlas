@@ -92,6 +92,10 @@ impl TransformerLayer for Qwen3AttentionLayer {
         Some(self)
     }
 
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn decode(
         &self,
         hidden: DevicePtr,
