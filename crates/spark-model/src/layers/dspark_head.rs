@@ -198,6 +198,20 @@ pub struct DeepseekV4DSparkHead {
     hc_expand_k: KernelHandle,
     hc_head_k: KernelHandle,
     argmax_k: KernelHandle,
+    // ── Net-new DSpark stage-forward kernel handles ──
+    /// mHC middle-mixing collapse (`hc_pre`) — attn + ffn residual sites.
+    hc_pre_k: KernelHandle,
+    /// mHC middle-mixing expand (`hc_post`) — attn + ffn residual sites.
+    hc_post_k: KernelHandle,
+    /// Net-new sparse windowed-MLA attention (`dspark_sparse_attention`).
+    #[allow(dead_code)] // consumed by the stage-attn helper (Increment B, same lane)
+    dspark_attn_k: KernelHandle,
+    /// Forward interleaved YaRN rope (q/kv) — reused V4 rope kernel.
+    #[allow(dead_code)] // consumed by the stage-attn helper (Increment B, same lane)
+    rope_fwd_k: KernelHandle,
+    /// Inverse (conjugate) interleaved YaRN rope (attn out de-rotate).
+    #[allow(dead_code)] // consumed by the stage-attn helper (Increment B, same lane)
+    rope_inv_k: KernelHandle,
 
     /// Monotonic `propose()` call index, appended to boundary-dump filenames so
     /// successive calls do not overwrite (used only when `ATLAS_DSPARK_DUMP_DIR`
@@ -263,6 +277,11 @@ impl DeepseekV4DSparkHead {
             hc_expand_k: gpu.kernel("hyper_connection", "hc_expand")?,
             hc_head_k: gpu.kernel("hyper_connection", "hc_head")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
+            hc_pre_k: gpu.kernel("hyper_connection", "hc_pre")?,
+            hc_post_k: gpu.kernel("hyper_connection", "hc_post")?,
+            dspark_attn_k: gpu.kernel("dspark_sparse_attention", "dspark_sparse_attention")?,
+            rope_fwd_k: gpu.kernel("rope", "rope_forward_yarn_interleaved")?,
+            rope_inv_k: gpu.kernel("rope", "rope_forward_yarn_interleaved_inv")?,
             dump_call: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -343,6 +362,125 @@ impl DeepseekV4DSparkHead {
         // before any net-new kernel lands. No-op when the env is unset.
         self.dump_boundary(ctx, proj, "main_proj_out", call, 1, h, stream)?;
         self.dump_boundary(ctx, out, "main_norm_out", call, 1, h, stream)?;
+        Ok(())
+    }
+
+    /// Increment A skeleton: the semi-AR block stage forward with the attention
+    /// **stubbed** (identity passthrough), exercising the mHC (`hc_pre`/`hc_post`)
+    /// + `rms_norm` + reused 256-expert `MoE` plumbing against the assembled
+    /// stage bodies. Gated by `ATLAS_DSPARK_DUMP_DIR` (dev/gate only) so a normal
+    /// serve stays byte-neutral until Increment B lands the net-new sparse-MLA
+    /// attention. Dumps `stage_out` (FP32 hc-streams `[block, hc_mult, hidden]`)
+    /// per stage for the golden gate. The FP32 highway is ping-ponged between two
+    /// buffers so `hc_post` never aliases its own residual (it mixes multiple
+    /// residual streams through the doubly-stochastic `comb`).
+    fn run_stage_forward_dev(&self, last_token: u32, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        use crate::layers::qwen3_attention::Qwen3AttentionLayer;
+        let gpu = ctx.gpu;
+        let h = ctx.config.hidden_size as u32;
+        let block = self.block_size as u32;
+        let eps = ctx.config.rms_norm_eps as f32;
+
+        // Downcast the assembled stage bodies to read their mHC params + MoE.
+        let bodies: Vec<&Qwen3AttentionLayer> = self
+            .module
+            .stages
+            .iter()
+            .map(|s| {
+                s.as_any()
+                    .and_then(|a| a.downcast_ref::<Qwen3AttentionLayer>())
+                    .ok_or_else(|| anyhow::anyhow!("DSpark stage body is not Qwen3AttentionLayer"))
+            })
+            .collect::<Result<_>>()?;
+        let hc0 = bodies[0]
+            .hc
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DSpark stage has no mHC weights"))?;
+        let hc_mult = hc0.hc_mult as u32;
+        let sinkhorn = hc0.sinkhorn_iters as u32;
+        let hc_eps = hc0.hc_eps;
+
+        // Per-call scratch (correctness-first; a batched/stateful profile pools these).
+        let hidden_bytes = (block * h) as usize * 2; // BF16 [block, hidden]
+        let stream_bytes = (block * hc_mult * h) as usize * 4; // FP32 [block, hc_mult, hidden]
+        let mut cur = gpu.alloc(stream_bytes)?; // FP32 highway (ping)
+        let mut nxt = gpu.alloc(stream_bytes)?; // FP32 highway (pong)
+        let x_embed = gpu.alloc(hidden_bytes)?;
+        let y_out = gpu.alloc(hidden_bytes)?; // hc_pre collapsed (BF16)
+        let post = gpu.alloc((block * hc_mult) as usize * 4)?; // FP32
+        let comb = gpu.alloc((block * hc_mult * hc_mult) as usize * 4)?; // FP32
+        let norm_out = gpu.alloc(hidden_bytes)?; // rms_norm out / MoE in-place (BF16)
+        let sublayer = gpu.alloc(hidden_bytes)?; // attn output (BF16)
+
+        // Noise block embed: [anchor=last_token, noise×(block-1)] → x_embed [block, hidden].
+        let row_bytes = h as usize * 2;
+        for t in 0..block as usize {
+            let tok = if t == 0 { last_token } else { self.noise_token_id } as usize;
+            let src = self.embed_tokens.weight.offset(tok * row_bytes);
+            gpu.copy_d2d_async(src, x_embed.offset(t * row_bytes), row_bytes, stream)?;
+        }
+        // hc_expand: x_embed → cur [block, hc_mult, hidden] FP32.
+        ops::hc_expand(gpu, self.hc_expand_k, x_embed, cur, block, h, hc_mult, stream)?;
+
+        for (i, l) in bodies.iter().enumerate() {
+            let hc = l.hc.as_ref().unwrap();
+            // ── attn residual site: hc_pre → attn_norm → [STUB attn] → hc_post ──
+            ops::hc_pre(
+                gpu, self.hc_pre_k, cur, hc.attn.hc_fn, hc.attn.hc_scale, hc.attn.hc_base, y_out,
+                post, comb, block, h, hc_mult, sinkhorn, eps, hc_eps, stream,
+            )?;
+            ops::rms_norm(gpu, self.rms_norm_k, y_out, l.dspark_attn_norm(), norm_out, block, h, eps, stream)?;
+            // STUB: identity passthrough (Increment B replaces with sparse-MLA).
+            gpu.copy_d2d_async(norm_out, sublayer, hidden_bytes, stream)?;
+            ops::hc_post(gpu, self.hc_post_k, sublayer, cur, post, comb, nxt, block, h, hc_mult, stream)?;
+            std::mem::swap(&mut cur, &mut nxt);
+            // ── ffn residual site: hc_pre → ffn_norm → MoE → hc_post ──
+            ops::hc_pre(
+                gpu, self.hc_pre_k, cur, hc.ffn.hc_fn, hc.ffn.hc_scale, hc.ffn.hc_base, y_out, post,
+                comb, block, h, hc_mult, sinkhorn, eps, hc_eps, stream,
+            )?;
+            ops::rms_norm(gpu, self.rms_norm_k, y_out, l.dspark_ffn_norm(), norm_out, block, h, eps, stream)?;
+            l.dspark_ffn().forward_prefill(norm_out, block as usize, ctx, stream)?;
+            ops::hc_post(gpu, self.hc_post_k, norm_out, cur, post, comb, nxt, block, h, hc_mult, stream)?;
+            std::mem::swap(&mut cur, &mut nxt);
+            // stage_out = the post-ffn highway (FP32 [block, hc_mult, hidden]).
+            self.dump_boundary_f32(ctx, cur, "stage_out", i, block * hc_mult, h, stream)?;
+        }
+
+        for p in [cur, nxt, x_embed, y_out, post, comb, norm_out, sublayer] {
+            gpu.free(p)?;
+        }
+        Ok(())
+    }
+
+    /// FP32 variant of [`Self::dump_boundary`] for the hc-streams highway
+    /// (`stage_out` goldens are F32). Same filename contract, `_f32` suffix.
+    fn dump_boundary_f32(
+        &self,
+        ctx: &ForwardContext,
+        src: DevicePtr,
+        tag: &str,
+        call: usize,
+        rows: u32,
+        cols: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let Ok(dir) = std::env::var("ATLAS_DSPARK_DUMP_DIR") else {
+            return Ok(());
+        };
+        if dir.is_empty() {
+            return Ok(());
+        }
+        let gpu = ctx.gpu;
+        let n_bytes = rows as usize * cols as usize * 4; // FP32
+        gpu.synchronize(stream)?;
+        let mut buf = vec![0u8; n_bytes];
+        gpu.copy_d2h(src, &mut buf)?;
+        let path = format!("{dir}/{tag}__call{call:04}__r{rows}_c{cols}_f32.bin");
+        match std::fs::write(&path, &buf) {
+            Ok(()) => tracing::info!("DSPARK DUMP: wrote {path} ({rows}x{cols} FP32)"),
+            Err(e) => tracing::warn!("DSPARK DUMP: write {path} failed: {e}"),
+        }
         Ok(())
     }
 
@@ -515,6 +653,19 @@ impl DraftProposer for DeepseekV4DSparkHead {
         // then `propose()` drafts nothing rather than silently substituting the
         // wrong (per-token MLA) attention, which would diverge on the
         // `stage_out` goldens.
+        // Increment A (dev/gate only): run the stage-forward plumbing skeleton
+        // (mHC + norm + reused MoE; attention STUBBED) to dump `stage_out` for
+        // the golden gate. Gated on `ATLAS_DSPARK_DUMP_DIR` so a normal serve is
+        // byte-neutral (still drafts nothing). Increment B replaces the stub with
+        // the net-new sparse-MLA attention and returns the K=1 draft token.
+        if std::env::var("ATLAS_DSPARK_DUMP_DIR")
+            .map(|d| !d.is_empty())
+            .unwrap_or(false)
+        {
+            if let Err(e) = self.run_stage_forward_dev(_last_token, ctx, stream) {
+                tracing::warn!("DSpark stage-forward dev skeleton failed: {e}");
+            }
+        }
         tracing::debug!(
             "DSpark propose: semi-AR block forward (sparse-MLA stages) is the net-new \
              kernel boundary — drafting none pending the GPU-convergence lane"
