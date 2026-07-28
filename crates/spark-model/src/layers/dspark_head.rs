@@ -451,9 +451,17 @@ impl DeepseekV4DSparkHead {
         let sublayer = gpu.alloc(hidden_bytes)?; // attn output (BF16)
 
         // Noise block embed: [anchor=last_token, noise×(block-1)] → x_embed [block, hidden].
+        // Diagnostic (default OFF): route-B pins the block ANCHOR (row 0) to the
+        // matched reference token so b01/b02 row-0 lines up with the golden pair;
+        // without it Atlas embeds its live `last_token` and row 0 diverges (rows
+        // 1..block are the fixed noise token and already match). Neutral when unset.
+        let anchor = std::env::var("ATLAS_DSPARK_INJECT_ANCHOR_TOKEN")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(last_token);
         let row_bytes = h as usize * 2;
         for t in 0..block as usize {
-            let tok = if t == 0 { last_token } else { self.noise_token_id } as usize;
+            let tok = if t == 0 { anchor } else { self.noise_token_id } as usize;
             let src = self.embed_tokens.weight.offset(tok * row_bytes);
             gpu.copy_d2d_async(src, x_embed.offset(t * row_bytes), row_bytes, stream)?;
         }
@@ -574,8 +582,13 @@ impl DeepseekV4DSparkHead {
         let h = ctx.config.hidden_size as u32;
         let block = self.block_size as u32;
         let eps = ctx.config.rms_norm_eps as f32;
-        let tp = ctx.config.tp_world_size.max(1) as u32;
-        let nq = ctx.config.num_attention_heads as u32 / tp; // n_local_heads
+        // `num_attention_heads` is already TP-local (see the "TP-local head counts"
+        // topology log and `qwen3_attention/prefill_weights.rs`: `nq =
+        // config.num_attention_heads`). The drafter MLA assembles to `local nq=32`
+        // (wq_b [32768,1024]→col). Dividing by `tp` again halved the drafter to 16
+        // heads → Q shape [block,16,512] vs reference [block,32,512] → wrong Q →
+        // downstream cos≈0. Use the config value directly.
+        let nq = ctx.config.num_attention_heads as u32; // already TP-local (n_local_heads)
         let q_lora = mla.q_lora_rank as u32;
         let o_lora = mla.o_lora_rank as u32;
         let rope = mla.rope as u32;
