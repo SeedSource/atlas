@@ -212,30 +212,25 @@ pub fn load_v4_dspark_module(
         )?;
         // Drafter stage MoE experts are native Mxfp4E8m0. The 5-row stage
         // prefill (`FfnComponent::forward_prefill`) requires the transposed
-        // pointer table (`gate_ptrs_t`) or it hits the non-transposed fallback
-        // that has no E8M0 variant and panics. Build it here, mirroring the
-        // MTP body (`mtp.rs`): full transpose, gate+up fallback under memory
-        // pressure. Same native MXFP4/E8M0 transposed prefill kernel as the
-        // main DSpark model under ATLAS_UNIFIED_MOE_LAYOUT=1 — no new kernel.
-        match body.transpose_moe_for_prefill(gpu, config) {
-            Ok(()) => tracing::info!(
-                "DeepSeek-V4 DSpark stage {i}: MoE transpose_for_prefill OK (gate_ptrs_t built)"
-            ),
-            Err(e) => {
-                tracing::warn!(
-                    "DeepSeek-V4 DSpark stage {i} full MoE transpose failed ({e:#}); trying gate+up only"
-                );
-                body.transpose_moe_gate_up_for_prefill(gpu, config).map_err(|e2| {
-                    anyhow::anyhow!(
-                        "DeepSeek-V4 DSpark stage {i} MoE transpose failed (full: {e:#}; gate+up: {e2:#}). \
-                         Drafter stage prefill needs E8M0 transposed kernels with gate_ptrs_t."
-                    )
-                })?;
-                tracing::info!(
-                    "DeepSeek-V4 DSpark stage {i}: MoE gate+up transpose OK (down via scratch)"
-                );
-            }
-        }
+        // pointer tables (gate_ptrs_t/up_ptrs_t AND down_ptrs_t) or it hits the
+        // non-transposed fallbacks, which have no E8M0 variant and panic. Build
+        // the FULL set via the main-model *unified* pass, which frees the
+        // untransposed originals between phases — the drafter only ever runs
+        // prefill (never decode), so the originals are dead weight and freeing
+        // them keeps the 3 extra stage tables inside the KV budget. Same native
+        // MXFP4/E8M0 transposed prefill kernel path the main DSpark model uses
+        // under ATLAS_UNIFIED_MOE_LAYOUT=1 — no new kernel. (A gate+up-only
+        // fallback would leave down_ptrs_t None → the down projection panics, so
+        // there is no useful partial fallback here: full transpose or error.)
+        body.transpose_moe_for_prefill_unified(gpu, config).map_err(|e| {
+            anyhow::anyhow!(
+                "DeepSeek-V4 DSpark stage {i} MoE unified transpose failed ({e:#}). \
+                 Drafter stage prefill needs E8M0 transposed kernels with gate_ptrs_t/down_ptrs_t."
+            )
+        })?;
+        tracing::info!(
+            "DeepSeek-V4 DSpark stage {i}: MoE transpose_for_prefill_unified OK (gate/up/down _ptrs_t built, originals freed)"
+        );
         stages.push(body);
         if is_last {
             last_hc_head = hc_head;
