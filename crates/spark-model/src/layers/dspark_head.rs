@@ -198,6 +198,14 @@ pub struct DeepseekV4DSparkHead {
     /// and issues no wo_b all-reduce.
     drafter_nq: u32,
     drafter_o_groups: u32,
+    /// Dedicated scratch arena for the ENTIRE drafter forward (project_main,
+    /// stages, reused MoE `forward_prefill`, head). The drafter runs in propose()
+    /// BEFORE the captured K2 verify graph replays; the verify graph replay-reads
+    /// the shared `ctx.buffers` (hidden_states / moe_output / gate_logits /
+    /// ssm_* / attn_output / expert_*). Running the drafter against its own arena
+    /// removes ALL aliasing with the verify graph's buffers (the illegal-address
+    /// crash) without touching the shared MoE or the K2 verify. Block-sized.
+    drafter_arena: spark_runtime::buffers::BufferArena,
 
     // Kernel handles (mirrors `DeepseekV4MtpHead`).
     rms_norm_k: KernelHandle,
@@ -285,6 +293,18 @@ impl DeepseekV4DSparkHead {
         let (drafter_nq, drafter_o_groups) =
             crate::weight_loader::deepseek_v4::dspark::drafter_head_counts(config);
 
+        // Dedicated drafter scratch arena (block-sized): isolates the entire
+        // drafter forward from the shared ctx.buffers the K2 verify graph reads.
+        // max_seq_len 4096 / kv_block 16 mirror the arena test defaults; the
+        // drafter never uses the seq-len-scaled (paged-KV) buffers.
+        let drafter_arena = spark_runtime::buffers::BufferArena::new(
+            config,
+            config.dspark_block_size.max(1),
+            4096,
+            16,
+            gpu,
+        )?;
+
         Ok(Self {
             module,
             embed_tokens,
@@ -296,6 +316,7 @@ impl DeepseekV4DSparkHead {
             main_kv_caches,
             drafter_nq,
             drafter_o_groups,
+            drafter_arena,
             // V4 ships HF-vanilla norm weights (norms are loaded exactly) — the
             // offset-from-1 kernel would apply `1 + w`.
             rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
@@ -1028,12 +1049,30 @@ impl DraftProposer for DeepseekV4DSparkHead {
         // target capture — removes generation/token drift so `project_main`
         // (main_proj + main_norm) can be gated against the golden in isolation.
         // No-op unless the env is set; fails loudly on any shape/byte mismatch.
-        let main_x = ctx.buffers.hidden_states();
-        let injected = self.maybe_inject_main_hidden(ctx)?;
+        // Run the ENTIRE drafter forward against the dedicated drafter arena so
+        // none of its scratch (hidden_states / norm_output / moe_output /
+        // gate_logits / ssm_* / attn_output / expert_*) aliases the shared
+        // ctx.buffers the captured K2 verify graph replay-reads. Copy every ctx
+        // field (all Copy), swap only `buffers`.
+        let dctx = ForwardContext {
+            buffers: &self.drafter_arena,
+            gpu: ctx.gpu,
+            config: ctx.config,
+            attn_metadata: ctx.attn_metadata,
+            profile: ctx.profile,
+            comm: ctx.comm,
+            graph_capture: ctx.graph_capture,
+            gdn_exact_replay: ctx.gdn_exact_replay,
+            token_ids: ctx.token_ids,
+            routed_lora_layers: ctx.routed_lora_layers,
+            midchunk_capture: None, // drafter does no SSM midchunk tail capture
+        };
+        let main_x = dctx.buffers.hidden_states();
+        let injected = self.maybe_inject_main_hidden(&dctx)?;
         let main_hidden_src = injected.or(target_hidden_stack);
         let have_main_x = main_hidden_src.is_some();
         if let Some(main_hidden) = main_hidden_src {
-            self.project_main(main_hidden, main_x, ctx, stream)?;
+            self.project_main(main_hidden, main_x, &dctx, stream)?;
             tracing::debug!("DSpark propose: project_main done (main_norm_out ready)");
         } else {
             tracing::debug!("DSpark propose: no target_hidden_stack — skipping project_main");
@@ -1083,7 +1122,7 @@ impl DraftProposer for DeepseekV4DSparkHead {
         if std::env::var("ATLAS_DSPARK_EMIT_DUMMY").is_ok() {
             return Ok(vec![_last_token]);
         }
-        match self.run_stage_forward_dev(_last_token, _position, main_x, ctx, stream) {
+        match self.run_stage_forward_dev(_last_token, _position, main_x, &dctx, stream) {
             Ok(Some(tok)) => Ok(vec![tok]),
             Ok(None) => Ok(Vec::new()),
             Err(e) => {
