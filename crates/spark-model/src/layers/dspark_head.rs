@@ -1075,6 +1075,14 @@ impl DraftProposer for DeepseekV4DSparkHead {
         if !have_main_x {
             return Ok(Vec::new());
         }
+        // DIAGNOSTIC (default OFF): emit a fixed valid token WITHOUT running the
+        // drafter forward, to bisect an e2e verify crash — does the K2 verify
+        // fault because drafting runs at all (verify-integration bug), or because
+        // the drafter forward disturbs shared decode scratch the captured verify
+        // graph replays? If the crash persists with this on, it is not the forward.
+        if std::env::var("ATLAS_DSPARK_EMIT_DUMMY").is_ok() {
+            return Ok(vec![_last_token]);
+        }
         match self.run_stage_forward_dev(_last_token, _position, main_x, ctx, stream) {
             Ok(Some(tok)) => Ok(vec![tok]),
             Ok(None) => Ok(Vec::new()),

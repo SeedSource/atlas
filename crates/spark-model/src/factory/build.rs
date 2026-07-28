@@ -641,7 +641,15 @@ pub fn build_model(
         max_batch_size,
         effective_mtp_quant,
         use_speculative,
-        v4_mtp_module.is_some(),
+        // has_postconstructed_mtp: count BOTH the NVIDIA MTP head AND the native
+        // DSpark drafter. The per-sequence SSM verify scratch (conv/h
+        // intermediates + checkpoints) is handed out whenever `proposer.is_some()`
+        // (meta.rs), so the SsmStatePool must be sized to match — else the K2
+        // verify GDN kernels (gdn_verify_fused_conv_k2) index an unallocated
+        // sub-pool → CUDA illegal address on the first decode. DSpark installs a
+        // post-constructed proposer with an empty `mtp_weights`, so without this
+        // it is missed by the pool-sizing has_mtp while still emitting drafts.
+        v4_mtp_module.is_some() || v4_dspark_module.is_some(),
         prefix_cache,
         mtp_vocab_size,
         comm,
