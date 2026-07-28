@@ -413,6 +413,11 @@ impl DeepseekV4DSparkHead {
         let h = ctx.config.hidden_size as u32;
         let block = self.block_size as u32;
         let eps = ctx.config.rms_norm_eps as f32;
+        // Env-gated intra-stage boundary dumps for first-divergence localization
+        // (12 boundaries; disabled by default, and additionally no-op unless
+        // ATLAS_DSPARK_DUMP_DIR is set). Pure device→host reads — neutral to the
+        // computation, so `stage_out` is byte-identical with this on or off.
+        let dump_bd = std::env::var("ATLAS_DSPARK_DUMP_STAGE_BOUNDARIES").is_ok();
 
         // Downcast the assembled stage bodies to read their mHC params + MoE.
         let bodies: Vec<&Qwen3AttentionLayer> = self
@@ -480,28 +485,52 @@ impl DeepseekV4DSparkHead {
                 gpu, self.hc_pre_k, cur, hc.attn.hc_fn, hc.attn.hc_scale, hc.attn.hc_base, y_out,
                 post, comb, block, h, hc_mult, sinkhorn, eps, hc_eps, stream,
             )?;
+            // B01: hc_pre output (collapsed, BF16 [block, hidden]).
+            if dump_bd {
+                self.dump_boundary(ctx, y_out, "b01_hc_pre", i, block, h, stream)?;
+            }
             ops::rms_norm(gpu, self.rms_norm_k, y_out, l.dspark_attn_norm(), norm_out, block, h, eps, stream)?;
+            // B02: attn_norm output (BF16 [block, hidden]).
+            if dump_bd {
+                self.dump_boundary(ctx, norm_out, "b02_attn_norm", i, block, h, stream)?;
+            }
             // Route-B: inject the golden post-store ring for this stage (→ skip the
             // in-kernel store so the injected ring is authoritative). No-op OFF.
             let skip_store = self.maybe_inject_ring(i, ctx)?;
-            // Net-new sparse-MLA stage attention (Increment B).
+            // Net-new sparse-MLA stage attention (Increment B). B03–B08 dumped inside.
             self.stage_attn(
                 *l, norm_out, main_x, block_pos_dev, main_pos_dev, valid_main_len,
-                &self.main_kv_caches[i], main_slot, skip_store, sublayer, ctx, stream,
+                &self.main_kv_caches[i], main_slot, skip_store, sublayer, i, dump_bd, ctx, stream,
             )?;
             ops::hc_post(gpu, self.hc_post_k, sublayer, cur, post, comb, nxt, block, h, hc_mult, stream)?;
             std::mem::swap(&mut cur, &mut nxt);
+            // B09: attention hc_post output (FP32 highway [block, hc_mult, hidden]).
+            if dump_bd {
+                self.dump_boundary_f32(ctx, cur, "b09_attn_hcpost", i, block * hc_mult, h, stream)?;
+            }
             // ── ffn residual site: hc_pre → ffn_norm → MoE → hc_post ──
             ops::hc_pre(
                 gpu, self.hc_pre_k, cur, hc.ffn.hc_fn, hc.ffn.hc_scale, hc.ffn.hc_base, y_out, post,
                 comb, block, h, hc_mult, sinkhorn, eps, hc_eps, stream,
             )?;
             ops::rms_norm(gpu, self.rms_norm_k, y_out, l.dspark_ffn_norm(), norm_out, block, h, eps, stream)?;
+            // B10: ffn_norm output (BF16 [block, hidden]) — dump before in-place MoE.
+            if dump_bd {
+                self.dump_boundary(ctx, norm_out, "b10_ffn_norm", i, block, h, stream)?;
+            }
             l.dspark_ffn().forward_prefill(norm_out, block as usize, ctx, stream)?;
+            // B11: MoE output (BF16 [block, hidden], in-place in norm_out).
+            if dump_bd {
+                self.dump_boundary(ctx, norm_out, "b11_moe_out", i, block, h, stream)?;
+            }
             ops::hc_post(gpu, self.hc_post_k, norm_out, cur, post, comb, nxt, block, h, hc_mult, stream)?;
             std::mem::swap(&mut cur, &mut nxt);
             // stage_out = the post-ffn highway (FP32 [block, hc_mult, hidden]).
             self.dump_boundary_f32(ctx, cur, "stage_out", i, block * hc_mult, h, stream)?;
+            // B12: same tensor as stage_out, uniform boundary-set name.
+            if dump_bd {
+                self.dump_boundary_f32(ctx, cur, "b12_stage_out", i, block * hc_mult, h, stream)?;
+            }
         }
 
         for p in [
@@ -532,6 +561,8 @@ impl DeepseekV4DSparkHead {
         main_slot: usize,
         skip_store: bool,
         out: DevicePtr,
+        stage_idx: usize,
+        dump_bd: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -586,8 +617,16 @@ impl DeepseekV4DSparkHead {
             ops::dense_gemv(gpu, self.dense_gemv_k, qra_n.offset(t * q_lora as usize * 2), &mla.wq_b, q.offset(t * (nq * hd) as usize * 2), nq * hd, q_lora, stream)?;
         }
         ops::rms_norm(gpu, self.rms_norm_k, q, &self.q_headnorm_ones, q_n, block * nq, hd, eps, stream)?;
+        // B03: Q projection (post per-head norm, PRE-rope) BF16 [block, nq, hd].
+        if dump_bd {
+            self.dump_boundary(ctx, q_n, "b03_q_proj", stage_idx, block * nq, hd, stream)?;
+        }
         // kv: kv_norm(kv) over head_dim
         ops::rms_norm(gpu, self.rms_norm_k, kv, &mla.kv_a_norm, kv_n, block, hd, eps, stream)?;
+        // B04: draft-KV projection (post kv_norm, PRE-rope) BF16 [block, hd].
+        if dump_bd {
+            self.dump_boundary(ctx, kv_n, "b04_kv_proj", stage_idx, block, hd, stream)?;
+        }
         // rope q (trailing `rope` lanes): extract → rope_yarn(fwd) → writeback
         ops::mla_q_rope_extract_batched(gpu, self.mla_q_rope_extract_batched_k, q_n, rope_tmp, block, nq, hd, nope, rope, nq * hd, stream)?;
         ops::rope_yarn(gpu, self.rope_fwd_k, rope_tmp, rope_tmp, block_pos_dev, block, nq, 0, rope, rope, mla.main_inv_freq, 1.0, stream)?;
@@ -611,11 +650,19 @@ impl DeepseekV4DSparkHead {
 
         // ── sparse windowed-MLA attention (net-new kernel) ──
         ops::dspark_sparse_attention(gpu, self.dspark_attn_k, q_n, kv_n, ring.buf, valid_dev, mla.attn_sink, attn_out, scale, 1, block, nq, hd, window, stream)?;
+        // B05: sparse-MLA output, PRE inverse-rope BF16 [block, nq, hd].
+        if dump_bd {
+            self.dump_boundary(ctx, attn_out, "b05_smla_out", stage_idx, block * nq, hd, stream)?;
+        }
 
         // ── inverse-rope the attention output (de-rotate by block position) ──
         ops::mla_q_rope_extract_batched(gpu, self.mla_q_rope_extract_batched_k, attn_out, rope_tmp, block, nq, hd, nope, rope, nq * hd, stream)?;
         ops::rope_yarn(gpu, self.rope_inv_k, rope_tmp, rope_tmp, block_pos_dev, block, nq, 0, rope, rope, mla.main_inv_freq, 1.0, stream)?;
         ops::mla_q_rope_writeback_batched(gpu, self.mla_q_rope_writeback_batched_k, rope_tmp, attn_out, block, nq, hd, nope, rope, nq * hd, stream)?;
+        // B06: inverse-RoPE output BF16 [block, nq, hd].
+        if dump_bd {
+            self.dump_boundary(ctx, attn_out, "b06_invrope_out", stage_idx, block * nq, hd, stream)?;
+        }
 
         // ── grouped low-rank O-projection (wo_a block-diagonal → wo_b), per block token ──
         for t in 0..b {
@@ -630,11 +677,23 @@ impl DeepseekV4DSparkHead {
             }
             ops::dense_gemv(gpu, self.dense_gemv_k, ol_t, &mla.wo_b, o_out.offset(t * row_h), h, latent_dim, stream)?;
         }
+        // B07: grouped O-projection = wo_a grouped output `o_latent`
+        // [block, o_groups*o_lora], the natural PRE-reduce checkpoint that maps
+        // to the reference `projected` (dspark.py:526-539; wo_b/RowParallel is
+        // the reduce = B08). Not the wo_b local partial (reference never exposes
+        // it, and it is TP-sharding-dependent / non-comparable).
+        if dump_bd {
+            self.dump_boundary(ctx, o_latent, "b07_oproj_wo_a", stage_idx, block, latent_dim, stream)?;
+        }
         // ── TP all-reduce (wo_b is row-parallel) ──
         if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {
             comm.all_reduce_async(o_out.0, (block * h) as usize * 2, stream)?;
+        }
+        // B08: O-projection output AFTER TP all-reduce BF16 [block, hidden].
+        if dump_bd {
+            self.dump_boundary(ctx, o_out, "b08_oproj_postred", stage_idx, block, h, stream)?;
         }
         gpu.copy_d2d_async(o_out, out, b * row_h, stream)?;
 
