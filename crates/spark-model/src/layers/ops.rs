@@ -17,6 +17,8 @@ mod activations;
 mod dispatch_helpers;
 #[path = "ops/dispatch_proj.rs"]
 mod dispatch_proj;
+#[path = "ops/dspark_attention.rs"]
+mod dspark_attention;
 #[path = "ops/embeddings.rs"]
 mod embeddings;
 #[path = "ops/fp8_gemv_batch.rs"]
@@ -115,6 +117,7 @@ mod ssm_ssd;
 pub use activations::*;
 pub use dispatch_helpers::*;
 pub use dispatch_proj::*;
+pub use dspark_attention::*;
 pub use embeddings::*;
 pub use fp8_gemv_batch::*;
 pub use fp8_moe::*;
