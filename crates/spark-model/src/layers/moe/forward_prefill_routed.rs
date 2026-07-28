@@ -20,6 +20,39 @@ fn grouped_cutlass_gate_up_enabled() -> bool {
         == Some("1")
 }
 
+/// The gate_up prefill path the routed grouped-GEMM dispatch selects, as a pure
+/// function of the two facts that drive the branch in `run_routed_grouped_gemm`:
+/// whether the transposed pointer tables (`gate_ptrs_t`/`up_ptrs_t`) were built,
+/// and the routed experts' quant format. Extracted so the decision is
+/// unit-testable without a GPU — in particular that native-MXFP4/E8M0 experts
+/// WITH a transposed table select the E8M0 transposed kernel (the DSpark drafter
+/// fix), NOT the non-transposed fallback that has no E8M0 variant and panics.
+/// `debug_assert`ed against the live branch at both arms so it can never drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefillGateUpPath {
+    /// E8M0 transposed fused gate_up (`moe_fused_gate_up_t_k64_e8m0`).
+    E8m0Transposed,
+    /// NVFP4/FP8 transposed fused gate_up (cutlass / fp4 / m128 / k64_n128).
+    Nvfp4Transposed,
+    /// Non-transposed grouped fallback — panics for E8M0 (no variant wired).
+    NonTransposedFallback,
+}
+
+pub(crate) fn prefill_gate_up_path(
+    has_transposed_gate_up: bool,
+    experts_scale_kind: crate::weight_map::WeightQuantFormat,
+) -> PrefillGateUpPath {
+    if has_transposed_gate_up {
+        if experts_scale_kind == crate::weight_map::WeightQuantFormat::Mxfp4E8m0 {
+            PrefillGateUpPath::E8m0Transposed
+        } else {
+            PrefillGateUpPath::Nvfp4Transposed
+        }
+    } else {
+        PrefillGateUpPath::NonTransposedFallback
+    }
+}
+
 impl MoeLayer {
     /// Routed-expert grouped-GEMM path: upper-bound grid sizing → grouped
     /// gate+up GEMM → SiLU+mul → grouped down GEMM.
@@ -125,8 +158,16 @@ impl MoeLayer {
                 .memset_async(ctx.buffers.expert_down_out(), 0, down_bytes, stream)?;
         }
         if max_m_tiles > 0 {
+            // Mirror of the branch selection below (unit-tested via
+            // `prefill_gate_up_path`); debug-asserted at each arm so the mirror
+            // can never silently drift from the real dispatch.
+            let _prefill_path = prefill_gate_up_path(
+                self.gate_ptrs_t.is_some() && self.up_ptrs_t.is_some(),
+                self.experts_scale_kind,
+            );
             if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
                 if self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Mxfp4E8m0 {
+                    debug_assert_eq!(_prefill_path, PrefillGateUpPath::E8m0Transposed);
                     // ── ARM-2 Phase-K: native-MXFP4 (E8M0) fused gate_up ──
                     // Leading branch so E8M0 routed experts NEVER reach the
                     // NVFP4-only cutlass/fp4/m128 sub-paths below (structurally
@@ -275,6 +316,7 @@ impl MoeLayer {
                 // ARM-2 Phase-K straggler net: V4 native builds gate_ptrs_t, so
                 // E8M0 never reaches this non-transposed fallback. If it does,
                 // panic (a real finding) rather than run NVFP4-on-E8M0 garbage.
+                debug_assert_eq!(_prefill_path, PrefillGateUpPath::NonTransposedFallback);
                 self.experts_scale_kind.expect(
                     crate::weight_map::WeightQuantFormat::Nvfp4,
                     "prefill non-transposed gate_up fallback (no E8M0 variant wired)",
@@ -479,5 +521,46 @@ impl MoeLayer {
         prof_step!("grouped_silu_down");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod prefill_gate_up_path_tests {
+    use super::{PrefillGateUpPath, prefill_gate_up_path};
+    use crate::weight_map::WeightQuantFormat;
+
+    /// The DSpark drafter fix: native-MXFP4/E8M0 routed experts WITH the
+    /// transposed pointer table (built by `load_v4_dspark_module` calling
+    /// `transpose_moe_for_prefill`, mirroring the MTP body) select the E8M0
+    /// transposed prefill kernel — the same native path the main DSpark model
+    /// uses under `ATLAS_UNIFIED_MOE_LAYOUT=1`. NOT the non-transposed fallback.
+    #[test]
+    fn e8m0_with_transposed_table_selects_e8m0_transposed() {
+        assert_eq!(
+            prefill_gate_up_path(true, WeightQuantFormat::Mxfp4E8m0),
+            PrefillGateUpPath::E8m0Transposed
+        );
+    }
+
+    /// The pre-fix regression this change closes: E8M0 experts WITHOUT the
+    /// transposed table fall to the non-transposed path, which panics (no E8M0
+    /// variant wired). This is exactly what the drafter stage MoE hit before the
+    /// loader built `gate_ptrs_t`.
+    #[test]
+    fn e8m0_without_transposed_table_falls_to_panicking_fallback() {
+        assert_eq!(
+            prefill_gate_up_path(false, WeightQuantFormat::Mxfp4E8m0),
+            PrefillGateUpPath::NonTransposedFallback
+        );
+    }
+
+    /// NVFP4 experts with a transposed table take the NVFP4 transposed path
+    /// (unchanged behavior — guards against the mirror over-claiming E8M0).
+    #[test]
+    fn nvfp4_with_transposed_table_selects_nvfp4_transposed() {
+        assert_eq!(
+            prefill_gate_up_path(true, WeightQuantFormat::Nvfp4),
+            PrefillGateUpPath::Nvfp4Transposed
+        );
     }
 }
