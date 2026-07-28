@@ -210,8 +210,14 @@ pub struct DeepseekV4DSparkHead {
     #[allow(dead_code)] // consumed by the stage-attn helper (Increment B, same lane)
     rope_fwd_k: KernelHandle,
     /// Inverse (conjugate) interleaved YaRN rope (attn out de-rotate).
-    #[allow(dead_code)] // consumed by the stage-attn helper (Increment B, same lane)
     rope_inv_k: KernelHandle,
+    /// Extract the trailing `rope` lanes of an MLA `[*, heads, head_dim]` tensor
+    /// into a contiguous `[*, heads, rope]` buffer (for the rope kernels).
+    mla_q_rope_extract_batched_k: KernelHandle,
+    /// Write roped `[*, heads, rope]` lanes back into the full `[*, heads, head_dim]`.
+    mla_q_rope_writeback_batched_k: KernelHandle,
+    /// `[head_dim]` BF16 ones — non-affine per-head Q RMSNorm (`q*rsqrt(mean(q²)+eps)`).
+    q_headnorm_ones: DenseWeight,
 
     /// Monotonic `propose()` call index, appended to boundary-dump filenames so
     /// successive calls do not overwrite (used only when `ATLAS_DSPARK_DUMP_DIR`
@@ -282,6 +288,22 @@ impl DeepseekV4DSparkHead {
             dspark_attn_k: gpu.kernel("dspark_sparse_attention", "dspark_sparse_attention")?,
             rope_fwd_k: gpu.kernel("rope", "rope_forward_yarn_interleaved")?,
             rope_inv_k: gpu.kernel("rope", "rope_forward_yarn_interleaved_inv")?,
+            mla_q_rope_extract_batched_k: gpu
+                .kernel("mla_absorbed", "mla_q_rope_extract_batched")?,
+            mla_q_rope_writeback_batched_k: gpu
+                .kernel("mla_absorbed", "mla_q_rope_writeback_batched")?,
+            // Non-affine per-head Q RMSNorm: rms_norm with a [head_dim] BF16 ones
+            // weight (BF16 1.0 = 0x3F80 LE → bytes 0x80,0x3F).
+            q_headnorm_ones: {
+                let bytes = head_dim * 2;
+                let ptr = gpu.alloc(bytes)?;
+                let ones: Vec<u8> = std::iter::repeat_with(|| [0x80u8, 0x3Fu8])
+                    .take(head_dim)
+                    .flatten()
+                    .collect();
+                gpu.copy_h2d(&ones, ptr)?;
+                DenseWeight { weight: ptr }
+            },
             dump_call: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -374,7 +396,14 @@ impl DeepseekV4DSparkHead {
     /// per stage for the golden gate. The FP32 highway is ping-ponged between two
     /// buffers so `hc_post` never aliases its own residual (it mixes multiple
     /// residual streams through the doubly-stochastic `comb`).
-    fn run_stage_forward_dev(&self, last_token: u32, ctx: &ForwardContext, stream: u64) -> Result<()> {
+    fn run_stage_forward_dev(
+        &self,
+        last_token: u32,
+        position: usize,
+        main_x: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
         use crate::layers::qwen3_attention::Qwen3AttentionLayer;
         let gpu = ctx.gpu;
         let h = ctx.config.hidden_size as u32;
@@ -422,6 +451,18 @@ impl DeepseekV4DSparkHead {
         // hc_expand: x_embed → cur [block, hc_mult, hidden] FP32.
         ops::hc_expand(gpu, self.hc_expand_k, x_embed, cur, block, h, hc_mult, stream)?;
 
+        // Block draft positions = main_pos + [0..block); main-KV store slot/valid-len.
+        let window = self.main_kv_caches[0].window;
+        let main_slot = position % window;
+        let valid_main_len = ((position + 1).min(window)) as i32;
+        let block_pos_host: Vec<u8> = (0..block)
+            .flat_map(|t| (position as u32 + t).to_le_bytes())
+            .collect();
+        let block_pos_dev = gpu.alloc(block as usize * 4)?;
+        gpu.copy_h2d(&block_pos_host, block_pos_dev)?;
+        let main_pos_dev = gpu.alloc(4)?;
+        gpu.copy_h2d(&(position as u32).to_le_bytes(), main_pos_dev)?;
+
         for (i, l) in bodies.iter().enumerate() {
             let hc = l.hc.as_ref().unwrap();
             // ── attn residual site: hc_pre → attn_norm → [STUB attn] → hc_post ──
@@ -430,8 +471,11 @@ impl DeepseekV4DSparkHead {
                 post, comb, block, h, hc_mult, sinkhorn, eps, hc_eps, stream,
             )?;
             ops::rms_norm(gpu, self.rms_norm_k, y_out, l.dspark_attn_norm(), norm_out, block, h, eps, stream)?;
-            // STUB: identity passthrough (Increment B replaces with sparse-MLA).
-            gpu.copy_d2d_async(norm_out, sublayer, hidden_bytes, stream)?;
+            // Net-new sparse-MLA stage attention (Increment B).
+            self.stage_attn(
+                *l, norm_out, main_x, block_pos_dev, main_pos_dev, valid_main_len,
+                &self.main_kv_caches[i], main_slot, sublayer, ctx, stream,
+            )?;
             ops::hc_post(gpu, self.hc_post_k, sublayer, cur, post, comb, nxt, block, h, hc_mult, stream)?;
             std::mem::swap(&mut cur, &mut nxt);
             // ── ffn residual site: hc_pre → ffn_norm → MoE → hc_post ──
@@ -447,7 +491,138 @@ impl DeepseekV4DSparkHead {
             self.dump_boundary_f32(ctx, cur, "stage_out", i, block * hc_mult, h, stream)?;
         }
 
-        for p in [cur, nxt, x_embed, y_out, post, comb, norm_out, sublayer] {
+        for p in [
+            cur, nxt, x_embed, y_out, post, comb, norm_out, sublayer, block_pos_dev, main_pos_dev,
+        ] {
+            gpu.free(p)?;
+        }
+        Ok(())
+    }
+
+    /// Net-new DSpark stage attention (Increment B). Replaces the identity stub:
+    /// `_project_q_and_draft_kv` → `store_main_kv` → `dspark_sparse_attention`
+    /// (windowed MLA + sink) → inverse-rope → grouped low-rank O-projection →
+    /// TP all-reduce. Mirrors `attn.forward_dspark` (dspark.py:471-540) and
+    /// reuses the V4 decode rope/o-proj machinery. `attn_in` is the already-
+    /// collapsed, attn-normed `[block, hidden]` BF16 (hc_pre collapsed the mHC
+    /// streams, so no ndim-3 mean is needed). Writes `[block, hidden]` into `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_attn(
+        &self,
+        l: &crate::layers::qwen3_attention::Qwen3AttentionLayer,
+        attn_in: DevicePtr,
+        main_x: DevicePtr,
+        block_pos_dev: DevicePtr,
+        main_pos_dev: DevicePtr,
+        valid_main_len: i32,
+        ring: &DsparkMainKvCache,
+        main_slot: usize,
+        out: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let gpu = ctx.gpu;
+        let mla = l
+            .mla
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DSpark stage body has no MLA weights"))?;
+        let h = ctx.config.hidden_size as u32;
+        let block = self.block_size as u32;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let tp = ctx.config.tp_world_size.max(1) as u32;
+        let nq = ctx.config.num_attention_heads as u32 / tp; // n_local_heads
+        let q_lora = mla.q_lora_rank as u32;
+        let o_lora = mla.o_lora_rank as u32;
+        let rope = mla.rope as u32;
+        let hd = (mla.kv_lora_rank + mla.rope) as u32; // head_dim = kv_lora + rope
+        let nope = hd - rope; // = kv_lora
+        let window = ring.window as u32;
+        let scale = (hd as f32).powf(-0.5);
+        let o_groups = ctx.config.o_groups.max(1) as u32;
+        let group_in = (nq * hd) / o_groups;
+        let latent_dim = o_groups * o_lora;
+
+        // ── scratch (per-call; correctness-first) ──
+        let b = block as usize;
+        let qra = gpu.alloc(b * q_lora as usize * 2)?;
+        let qra_n = gpu.alloc(b * q_lora as usize * 2)?;
+        let q = gpu.alloc(b * (nq * hd) as usize * 2)?;
+        let q_n = gpu.alloc(b * (nq * hd) as usize * 2)?;
+        let kv = gpu.alloc(b * hd as usize * 2)?; // draft_kv (per block token)
+        let kv_n = gpu.alloc(b * hd as usize * 2)?;
+        let rope_tmp = gpu.alloc(b * (nq * rope) as usize * 2)?; // ≥ block*rope for kv too
+        let attn_out = gpu.alloc(b * (nq * hd) as usize * 2)?;
+        let o_latent = gpu.alloc(b * latent_dim as usize * 2)?;
+        let o_out = gpu.alloc(b * h as usize * 2)?;
+        let mkv = gpu.alloc(hd as usize * 2)?; // main-KV projection
+        let mkv_n = gpu.alloc(hd as usize * 2)?;
+        let valid_dev = gpu.alloc(4)?;
+        gpu.copy_h2d(&valid_main_len.to_le_bytes(), valid_dev)?;
+
+        let row_h = h as usize * 2;
+        // ── _project_q_and_draft_kv (down-proj is replicated / disable_tp) ──
+        for t in 0..b {
+            let x_t = attn_in.offset(t * row_h);
+            ops::dense_gemv(gpu, self.dense_gemv_k, x_t, &mla.wq_a, qra.offset(t * q_lora as usize * 2), q_lora, h, stream)?;
+            ops::dense_gemv(gpu, self.dense_gemv_k, x_t, &mla.wkv_a, kv.offset(t * hd as usize * 2), hd, h, stream)?;
+        }
+        // q: q_norm(qra) → wq_b → [nq,hd] → per-head rsqrt-norm
+        ops::rms_norm(gpu, self.rms_norm_k, qra, &mla.q_a_norm, qra_n, block, q_lora, eps, stream)?;
+        for t in 0..b {
+            ops::dense_gemv(gpu, self.dense_gemv_k, qra_n.offset(t * q_lora as usize * 2), &mla.wq_b, q.offset(t * (nq * hd) as usize * 2), nq * hd, q_lora, stream)?;
+        }
+        ops::rms_norm(gpu, self.rms_norm_k, q, &self.q_headnorm_ones, q_n, block * nq, hd, eps, stream)?;
+        // kv: kv_norm(kv) over head_dim
+        ops::rms_norm(gpu, self.rms_norm_k, kv, &mla.kv_a_norm, kv_n, block, hd, eps, stream)?;
+        // rope q (trailing `rope` lanes): extract → rope_yarn(fwd) → writeback
+        ops::mla_q_rope_extract_batched(gpu, self.mla_q_rope_extract_batched_k, q_n, rope_tmp, block, nq, hd, nope, rope, nq * hd, stream)?;
+        ops::rope_yarn(gpu, self.rope_fwd_k, rope_tmp, rope_tmp, block_pos_dev, block, nq, 0, rope, rope, mla.main_inv_freq, 1.0, stream)?;
+        ops::mla_q_rope_writeback_batched(gpu, self.mla_q_rope_writeback_batched_k, rope_tmp, q_n, block, nq, hd, nope, rope, nq * hd, stream)?;
+        // rope kv (single latent head)
+        ops::mla_q_rope_extract_batched(gpu, self.mla_q_rope_extract_batched_k, kv_n, rope_tmp, block, 1, hd, nope, rope, hd, stream)?;
+        ops::rope_yarn(gpu, self.rope_fwd_k, rope_tmp, rope_tmp, block_pos_dev, block, 1, 0, rope, rope, mla.main_inv_freq, 1.0, stream)?;
+        ops::mla_q_rope_writeback_batched(gpu, self.mla_q_rope_writeback_batched_k, rope_tmp, kv_n, block, 1, hd, nope, rope, hd, stream)?;
+
+        // ── store_main_kv: project main_x → kv_norm → rope(main_pos) → ring slot ──
+        ops::dense_gemv(gpu, self.dense_gemv_k, main_x, &mla.wkv_a, mkv, hd, h, stream)?;
+        ops::rms_norm(gpu, self.rms_norm_k, mkv, &mla.kv_a_norm, mkv_n, 1, hd, eps, stream)?;
+        ops::mla_q_rope_extract_batched(gpu, self.mla_q_rope_extract_batched_k, mkv_n, rope_tmp, 1, 1, hd, nope, rope, hd, stream)?;
+        ops::rope_yarn(gpu, self.rope_fwd_k, rope_tmp, rope_tmp, main_pos_dev, 1, 1, 0, rope, rope, mla.main_inv_freq, 1.0, stream)?;
+        ops::mla_q_rope_writeback_batched(gpu, self.mla_q_rope_writeback_batched_k, rope_tmp, mkv_n, 1, 1, hd, nope, rope, hd, stream)?;
+        gpu.copy_d2d_async(mkv_n, ring.buf.offset(main_slot * hd as usize * 2), hd as usize * 2, stream)?;
+
+        // ── sparse windowed-MLA attention (net-new kernel) ──
+        ops::dspark_sparse_attention(gpu, self.dspark_attn_k, q_n, kv_n, ring.buf, valid_dev, mla.attn_sink, attn_out, scale, 1, block, nq, hd, window, stream)?;
+
+        // ── inverse-rope the attention output (de-rotate by block position) ──
+        ops::mla_q_rope_extract_batched(gpu, self.mla_q_rope_extract_batched_k, attn_out, rope_tmp, block, nq, hd, nope, rope, nq * hd, stream)?;
+        ops::rope_yarn(gpu, self.rope_inv_k, rope_tmp, rope_tmp, block_pos_dev, block, nq, 0, rope, rope, mla.main_inv_freq, 1.0, stream)?;
+        ops::mla_q_rope_writeback_batched(gpu, self.mla_q_rope_writeback_batched_k, rope_tmp, attn_out, block, nq, hd, nope, rope, nq * hd, stream)?;
+
+        // ── grouped low-rank O-projection (wo_a block-diagonal → wo_b), per block token ──
+        for t in 0..b {
+            let ao_t = attn_out.offset(t * (nq * hd) as usize * 2);
+            let ol_t = o_latent.offset(t * latent_dim as usize * 2);
+            for g in 0..o_groups {
+                let in_g = ao_t.offset((g * group_in) as usize * 2);
+                let w_g = crate::weight_map::DenseWeight {
+                    weight: mla.wo_a.weight.offset((g * o_lora * group_in) as usize * 2),
+                };
+                ops::dense_gemv(gpu, self.dense_gemv_k, in_g, &w_g, ol_t.offset((g * o_lora) as usize * 2), o_lora, group_in, stream)?;
+            }
+            ops::dense_gemv(gpu, self.dense_gemv_k, ol_t, &mla.wo_b, o_out.offset(t * row_h), h, latent_dim, stream)?;
+        }
+        // ── TP all-reduce (wo_b is row-parallel) ──
+        if ctx.config.tp_world_size > 1
+            && let Some(comm) = ctx.comm
+        {
+            comm.all_reduce_async(o_out.0, (block * h) as usize * 2, stream)?;
+        }
+        gpu.copy_d2d_async(o_out, out, b * row_h, stream)?;
+
+        for p in [
+            qra, qra_n, q, q_n, kv, kv_n, rope_tmp, attn_out, o_latent, o_out, mkv, mkv_n, valid_dev,
+        ] {
             gpu.free(p)?;
         }
         Ok(())
@@ -615,10 +790,11 @@ impl DraftProposer for DeepseekV4DSparkHead {
         // target capture — removes generation/token drift so `project_main`
         // (main_proj + main_norm) can be gated against the golden in isolation.
         // No-op unless the env is set; fails loudly on any shape/byte mismatch.
+        let main_x = ctx.buffers.hidden_states();
         let injected = self.maybe_inject_main_hidden(ctx)?;
         let main_hidden_src = injected.or(target_hidden_stack);
+        let have_main_x = main_hidden_src.is_some();
         if let Some(main_hidden) = main_hidden_src {
-            let main_x = ctx.buffers.hidden_states();
             self.project_main(main_hidden, main_x, ctx, stream)?;
             tracing::debug!("DSpark propose: project_main done (main_norm_out ready)");
         } else {
@@ -658,12 +834,13 @@ impl DraftProposer for DeepseekV4DSparkHead {
         // the golden gate. Gated on `ATLAS_DSPARK_DUMP_DIR` so a normal serve is
         // byte-neutral (still drafts nothing). Increment B replaces the stub with
         // the net-new sparse-MLA attention and returns the K=1 draft token.
-        if std::env::var("ATLAS_DSPARK_DUMP_DIR")
-            .map(|d| !d.is_empty())
-            .unwrap_or(false)
+        if have_main_x
+            && std::env::var("ATLAS_DSPARK_DUMP_DIR")
+                .map(|d| !d.is_empty())
+                .unwrap_or(false)
         {
-            if let Err(e) = self.run_stage_forward_dev(_last_token, ctx, stream) {
-                tracing::warn!("DSpark stage-forward dev skeleton failed: {e}");
+            if let Err(e) = self.run_stage_forward_dev(_last_token, _position, main_x, ctx, stream) {
+                tracing::warn!("DSpark stage-forward failed: {e}");
             }
         }
         tracing::debug!(
