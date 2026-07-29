@@ -32,6 +32,20 @@ impl MoeLayer {
         //   ATLAS_V4_K2_BATCHED=1: per-token forward_batched (stable baseline)
         //   ATLAS_V4_K2_BATCH2=1: NVFP4 batch2 fused kernels (CUDA-700 history)
         if ctx.config.model_type == "deepseek_v4" {
+            // E8M0 (native MXFP4, per-32 scale) routed experts MUST NOT reach the
+            // unified-T batch2 verify kernel `moe_expert_gate_up_shared_batch2_t`:
+            // it is an NVFP4 kernel that hardcodes GROUP_SIZE=16 and would read
+            // `inter·h/16` scale bytes from the correctly-sized `inter·h/32` E8M0
+            // scale buffer — a 2× over-read → CUDA_ERROR_ILLEGAL_ADDRESS. No E8M0
+            // batch2 kernel exists, so route both verify tokens through the
+            // per-token unified-T path (`forward_batched`), whose
+            // `use_t_layout_for_prefill` branch selects the GS32 `_e8m0` kernel via
+            // `e8m0_or` — the same correct path ordinary decode already uses.
+            // Mirrors the BF16 fallback below. (Batch-2 K2 verify only; decode and
+            // the GS16/NVFP4 batch2 path are unaffected.)
+            if k2_e8m0_needs_per_token(self.experts_scale_kind) {
+                return self.forward_batched(input, 2, ctx, stream);
+            }
             // Default: NVFP4 batch2 (null shared-gate blend fixed 2026-07-24).
             // Opt-out: ATLAS_V4_K2_BATCHED=1 (per-token). Token-major: ATLAS_V4_K2_TOKEN_MAJOR=1.
             if std::env::var("ATLAS_V4_K2_BATCHED").ok().as_deref() == Some("1") {
@@ -542,5 +556,81 @@ impl MoeLayer {
         moe_stage!("ep_ar_shared");
 
         Ok(())
+    }
+}
+
+/// K2-verify unified-T MoE dispatch guard. E8M0 (native MXFP4, per-32 E8M0 scale)
+/// routed experts MUST take the per-token unified-T path (GS32 `_e8m0` kernel via
+/// `e8m0_or`), NOT the GS16 NVFP4 `moe_expert_gate_up_shared_batch2_t` batch2
+/// kernel: that kernel reads `inter·h/16` scale bytes from the correctly-sized
+/// `inter·h/32` E8M0 scale buffer — a 2× over-read → CUDA_ERROR_ILLEGAL_ADDRESS
+/// (and E4M3-decodes E8M0 scale bytes → garbage even in-bounds). Pure decision,
+/// unit-tested and wired at the top of `forward_k2`'s deepseek_v4 branch.
+pub(crate) fn k2_e8m0_needs_per_token(scale_kind: crate::weight_map::WeightQuantFormat) -> bool {
+    matches!(scale_kind, crate::weight_map::WeightQuantFormat::Mxfp4E8m0)
+}
+
+#[cfg(test)]
+mod k2_dispatch_tests {
+    use super::k2_e8m0_needs_per_token;
+    use crate::weight_map::WeightQuantFormat;
+
+    #[test]
+    fn e8m0_takes_per_token_path_not_gs16_batch2() {
+        // Mxfp4E8m0 → per-token unified-T (GS32 _e8m0), never the GS16 batch2_t kernel.
+        assert!(k2_e8m0_needs_per_token(WeightQuantFormat::Mxfp4E8m0));
+    }
+
+    #[test]
+    fn nvfp4_still_takes_batch2_kernel() {
+        // NVFP4 (GS16) is compatible with the batch2_t kernel → stays on it.
+        assert!(!k2_e8m0_needs_per_token(WeightQuantFormat::Nvfp4));
+    }
+
+    #[test]
+    fn bf16_and_fp8_dispatch_unchanged() {
+        // BF16 / FP8 K2 dispatch is decided by earlier gates (bf16_gate_weight_ptrs,
+        // fp8_gate_weight_ptrs) — the E8M0 guard must never divert them.
+        for f in [
+            WeightQuantFormat::Bf16,
+            WeightQuantFormat::Fp8SingleScale,
+            WeightQuantFormat::Fp8PerRow,
+        ] {
+            assert!(!k2_e8m0_needs_per_token(f));
+        }
+    }
+
+    #[test]
+    fn no_e8m0_tensor_reaches_gs16_batch2() {
+        // Exhaustive over the format enum: the ONLY format routed away from the
+        // batch2_t kernel by this guard is Mxfp4E8m0. Documents the invariant
+        // "no E8M0 tensor can reach the GS16 batch-2 kernel".
+        let all = [
+            WeightQuantFormat::Bf16,
+            WeightQuantFormat::Fp8PerRow,
+            WeightQuantFormat::Fp8BlockScaled,
+            WeightQuantFormat::Fp8SingleScale,
+            WeightQuantFormat::Nvfp4,
+            WeightQuantFormat::Mxfp4E8m0,
+        ];
+        for f in all {
+            assert_eq!(
+                k2_e8m0_needs_per_token(f),
+                f == WeightQuantFormat::Mxfp4E8m0,
+                "only Mxfp4E8m0 diverts to the per-token path"
+            );
+        }
+    }
+
+    #[test]
+    fn e8m0_gs32_scale_alloc_is_half_the_gs16_kernel_read() {
+        // Documents the hazard the guard prevents: for any (h, inter) an E8M0
+        // (GS32) scale buffer is exactly half the GS16 kernel's read span, so the
+        // GS16 batch2 kernel would over-read by 2× on every E8M0 expert.
+        for (h, inter) in [(4096usize, 2048usize), (2048, 1408), (5120, 1536)] {
+            let e8m0_alloc = inter * (h / 32); // transpose_for_gemm_gs, routed_gs=32
+            let gs16_read = inter * (h / 16); // batch2_t kernel, GROUP_SIZE=16
+            assert_eq!(gs16_read, 2 * e8m0_alloc);
+        }
     }
 }
