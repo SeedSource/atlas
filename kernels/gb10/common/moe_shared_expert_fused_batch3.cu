@@ -355,47 +355,55 @@ extern "C" __global__ void moe_weighted_sum_blend_batch3(
     __nv_bfloat16* my_output = output + (unsigned long long)token * hidden;
 
     // ── Phase 1: Compute gate scalar (dot product + sigmoid) ──
+    // NULL gate_weight = ungated shared expert (DeepSeek-V4) → sigmoid=1.0
+    // Missing this check was CUDA-700 on V4 EP MTP K3 (null deref).
+    // Mirrors moe_shared_expert_fused_batch2.cu:591 exactly.
     __shared__ float s_warp_sums[8];
     __shared__ float sigmoid_val;
 
-    float dot_acc = 0.0f;
-    unsigned int K8 = K / 8;
-    for (unsigned int k8 = tid; k8 < K8; k8 += 256) {
-        uint4 a_data = ((const uint4*)my_input)[k8];
-        uint4 w_data = ((const uint4*)gate_weight)[k8];
-        const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
-        const unsigned int w_raw[4] = {w_data.x, w_data.y, w_data.z, w_data.w};
+    if (gate_weight == 0) {
+        if (tid == 0) sigmoid_val = 1.0f;
+        __syncthreads();
+    } else {
+        float dot_acc = 0.0f;
+        unsigned int K8 = K / 8;
+        for (unsigned int k8 = tid; k8 < K8; k8 += 256) {
+            uint4 a_data = ((const uint4*)my_input)[k8];
+            uint4 w_data = ((const uint4*)gate_weight)[k8];
+            const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+            const unsigned int w_raw[4] = {w_data.x, w_data.y, w_data.z, w_data.w};
+
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {
+                __nv_bfloat16 a_lo, a_hi, w_lo, w_hi;
+                *(unsigned short*)&a_lo = (unsigned short)(a_raw[b] & 0xFFFF);
+                *(unsigned short*)&a_hi = (unsigned short)(a_raw[b] >> 16);
+                *(unsigned short*)&w_lo = (unsigned short)(w_raw[b] & 0xFFFF);
+                *(unsigned short*)&w_hi = (unsigned short)(w_raw[b] >> 16);
+                dot_acc += __bfloat162float(a_lo) * __bfloat162float(w_lo);
+                dot_acc += __bfloat162float(a_hi) * __bfloat162float(w_hi);
+            }
+        }
 
         #pragma unroll
-        for (int b = 0; b < 4; b++) {
-            __nv_bfloat16 a_lo, a_hi, w_lo, w_hi;
-            *(unsigned short*)&a_lo = (unsigned short)(a_raw[b] & 0xFFFF);
-            *(unsigned short*)&a_hi = (unsigned short)(a_raw[b] >> 16);
-            *(unsigned short*)&w_lo = (unsigned short)(w_raw[b] & 0xFFFF);
-            *(unsigned short*)&w_hi = (unsigned short)(w_raw[b] >> 16);
-            dot_acc += __bfloat162float(a_lo) * __bfloat162float(w_lo);
-            dot_acc += __bfloat162float(a_hi) * __bfloat162float(w_hi);
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            dot_acc += __shfl_down_sync(0xFFFFFFFF, dot_acc, offset);
         }
-    }
-
-    #pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        dot_acc += __shfl_down_sync(0xFFFFFFFF, dot_acc, offset);
-    }
-    if (lane == 0) {
-        s_warp_sums[warp_id] = dot_acc;
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-        float gate_scalar = 0.0f;
-        #pragma unroll
-        for (int w = 0; w < 8; w++) {
-            gate_scalar += s_warp_sums[w];
+        if (lane == 0) {
+            s_warp_sums[warp_id] = dot_acc;
         }
-        sigmoid_val = 1.0f / (1.0f + __expf(-gate_scalar));
+        __syncthreads();
+
+        if (tid == 0) {
+            float gate_scalar = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) {
+                gate_scalar += s_warp_sums[w];
+            }
+            sigmoid_val = 1.0f / (1.0f + __expf(-gate_scalar));
+        }
+        __syncthreads();
     }
-    __syncthreads();
 
     // ── Phase 2: Weighted sum + blend ──
     unsigned int j = blockIdx.x * blockDim.x + tid;
