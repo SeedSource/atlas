@@ -251,6 +251,58 @@ impl MoeLayer {
             let sh_gate_t = self.shared_gate_t.as_ref().unwrap_or(&null_qw);
             let sh_up_t = self.shared_up_t.as_ref().unwrap_or(&null_qw);
             let sh_down_t = self.shared_down_t.as_ref().unwrap_or(&null_qw);
+            // DIAGNOSTIC (ATLAS_DSPARK_K2_TAP, default OFF, read-only): before the
+            // batch2_t launch that faults (CUDA-700), dump the 2 verify token ids,
+            // their routed expert ids, and each id's gate_ptrs_t.packed_ptrs entry
+            // (NULL = EP-non-owned expert / OOB = id >= table). Pinpoints which
+            // token's expert set drives the invalid pointer. No behavior change.
+            if std::env::var("ATLAS_DSPARK_K2_TAP").is_ok() {
+                let _ = ctx.gpu.synchronize(stream);
+                let n = num_experts as usize;
+                let tk = top_k as usize;
+                if let Some(tid) = ctx.token_ids {
+                    let mut tb = vec![0u8; 8];
+                    if ctx.gpu.copy_d2h(tid, &mut tb).is_ok() {
+                        let toks: Vec<u32> = tb
+                            .chunks_exact(4)
+                            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        tracing::warn!("DSPARK_K2_TAP verify_tokens={toks:?} num_experts={n} top_k={tk}");
+                    }
+                }
+                let mut idx_bytes = vec![0u8; 2 * tk * 4];
+                let mut ptr_bytes = vec![0u8; n * 8];
+                if ctx.gpu.copy_d2h(indices_dev, &mut idx_bytes).is_ok()
+                    && ctx.gpu.copy_d2h(gate_t.packed_ptrs, &mut ptr_bytes).is_ok()
+                {
+                    let ids: Vec<u32> = idx_bytes
+                        .chunks_exact(4)
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let ptrs: Vec<u64> = ptr_bytes
+                        .chunks_exact(8)
+                        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
+                    for tok in 0..2usize {
+                        let sel = &ids[tok * tk..(tok + 1) * tk];
+                        let info: Vec<String> = sel
+                            .iter()
+                            .map(|&e| {
+                                let ee = e as usize;
+                                let tag = if ee >= n {
+                                    "OOB"
+                                } else if ptrs[ee] == 0 {
+                                    "NULL"
+                                } else {
+                                    "ok"
+                                };
+                                format!("e{e}:{tag}")
+                            })
+                            .collect();
+                        tracing::warn!("DSPARK_K2_TAP tok{tok} routed=[{}]", info.join(","));
+                    }
+                }
+            }
             ops::moe_expert_gate_up_shared_batch2_t(
                 ctx.gpu,
                 self.moe_expert_gate_up_shared_batch2_t_k,
