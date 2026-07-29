@@ -1236,7 +1236,37 @@ impl DraftProposer for DeepseekV4DSparkHead {
             return Ok(vec![_last_token]);
         }
         match self.run_stage_forward_dev(_last_token, _position, main_x, &dctx, stream) {
-            Ok(Some(tok)) => Ok(vec![tok]),
+            Ok(Some(tok)) => {
+                // DIAGNOSTIC (default OFF): forward-vs-token discriminator. The
+                // FULL drafter forward above already ran with every side effect
+                // (project_main, 3 stages, MoE, head/Markov/confidence, scratch
+                // writes, stream ops, proposal-state) intact — this only inspects
+                // its result and, when armed, overrides ONLY the externally
+                // emitted token with the anchor (`_last_token`). If the e2e verify
+                // crash persists with the anchor forced ⇒ the emitted token value
+                // is refuted (forward side-effect cause); if it flips to a clean
+                // HANG ⇒ the real token value / token-indexed verify path is the
+                // cause. Neutral when the env is unset: returns `vec![tok]`,
+                // byte-identical to production.
+                if std::env::var("ATLAS_DSPARK_FORCE_ANCHOR_EMIT").is_ok() {
+                    let vocab = ctx.config.vocab_size as u32;
+                    tracing::warn!(
+                        "DSPARK_DISCRIM: real_emit_token={tok} anchor_token={anchor} \
+                         vocab_size={vocab} real_in_range={real_ir} anchor_in_range={anch_ir} \
+                         position={pos} main_kv_pos={mkp} num_drafts={num_drafts} \
+                         ring_count={rc} FORCE_ANCHOR_EMIT=ON",
+                        anchor = _last_token,
+                        real_ir = tok < vocab,
+                        anch_ir = _last_token < vocab,
+                        pos = _position,
+                        mkp = _dspark_state.main_kv_pos,
+                        rc = self.main_kv_caches.len(),
+                    );
+                    Ok(vec![_last_token])
+                } else {
+                    Ok(vec![tok])
+                }
+            }
             Ok(None) => Ok(Vec::new()),
             Err(e) => {
                 tracing::warn!("DSpark drafter forward failed: {e} — drafting none");
