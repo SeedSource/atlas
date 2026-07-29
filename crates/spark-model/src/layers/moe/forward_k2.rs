@@ -270,36 +270,67 @@ impl MoeLayer {
                         tracing::warn!("DSPARK_K2_TAP verify_tokens={toks:?} num_experts={n} top_k={tk}");
                     }
                 }
+                // Kernel (moe_expert_gate_up_shared_batch2_t) reads, per expert:
+                //   packed span = (K/2)*N bytes  (K=h, N=inter; GROUP_SIZE-independent)
+                //   scale  span = (K/16)*N bytes (kernel hardcodes GROUP_SIZE=16)
+                let kh = h as usize;
+                let ni = inter as usize;
+                let exp_packed = (kh / 2) * ni;
+                let exp_scale16 = (kh / 16) * ni;
+                tracing::warn!(
+                    "DSPARK_K2_TAP scale_kind={:?} h={kh} inter={ni} kernel_read: packed={exp_packed} scale(gs16)={exp_scale16}",
+                    self.experts_scale_kind
+                );
                 let mut idx_bytes = vec![0u8; 2 * tk * 4];
-                let mut ptr_bytes = vec![0u8; n * 8];
+                let mut pptr_bytes = vec![0u8; n * 8];
+                let mut sptr_bytes = vec![0u8; n * 8];
                 if ctx.gpu.copy_d2h(indices_dev, &mut idx_bytes).is_ok()
-                    && ctx.gpu.copy_d2h(gate_t.packed_ptrs, &mut ptr_bytes).is_ok()
+                    && ctx.gpu.copy_d2h(gate_t.packed_ptrs, &mut pptr_bytes).is_ok()
+                    && ctx.gpu.copy_d2h(gate_t.scale_ptrs, &mut sptr_bytes).is_ok()
                 {
                     let ids: Vec<u32> = idx_bytes
                         .chunks_exact(4)
                         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                         .collect();
-                    let ptrs: Vec<u64> = ptr_bytes
+                    let pptrs: Vec<u64> = pptr_bytes
                         .chunks_exact(8)
                         .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
                         .collect();
+                    let sptrs: Vec<u64> = sptr_bytes
+                        .chunks_exact(8)
+                        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
+                    let reg = crate::weight_map::T_BUF_REGISTRY.get();
                     for tok in 0..2usize {
                         let sel = &ids[tok * tk..(tok + 1) * tk];
                         let info: Vec<String> = sel
                             .iter()
                             .map(|&e| {
                                 let ee = e as usize;
-                                let tag = if ee >= n {
-                                    "OOB"
-                                } else if ptrs[ee] == 0 {
-                                    "NULL"
-                                } else {
-                                    "ok"
+                                if ee >= n {
+                                    return format!("e{e}:OOB_ID");
+                                }
+                                let pp = pptrs[ee];
+                                let sp = sptrs[ee];
+                                if pp == 0 {
+                                    return format!("e{e}:NULL");
+                                }
+                                // registry lookup: (bytes, n, k, group_size)
+                                let look = |ptr: u64| -> Option<(usize, usize, usize, usize)> {
+                                    reg.and_then(|m| m.lock().ok().and_then(|g| g.get(&ptr).copied()))
                                 };
-                                format!("e{e}:{tag}")
+                                let (pb, ps) = (look(pp), look(sp));
+                                let pfit = pb.map(|(b, ..)| b >= exp_packed);
+                                let sfit = ps.map(|(b, ..)| b >= exp_scale16);
+                                let sgs = ps.map(|(_, _, _, gs)| gs).unwrap_or(0);
+                                let salloc = ps.map(|(b, ..)| b).unwrap_or(0);
+                                format!(
+                                    "e{e}[pfit={:?} sfit={:?} salloc={salloc} sgs={sgs}]",
+                                    pfit, sfit
+                                )
                             })
                             .collect();
-                        tracing::warn!("DSPARK_K2_TAP tok{tok} routed=[{}]", info.join(","));
+                        tracing::warn!("DSPARK_K2_TAP tok{tok} routed=[{}]", info.join(" "));
                     }
                 }
             }

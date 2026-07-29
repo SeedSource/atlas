@@ -93,6 +93,24 @@ pub struct QuantizedWeight {
     pub weight_scale_2_vec: DevicePtr,
 }
 
+/// DIAGNOSTIC (ATLAS_DSPARK_K2_TAP): records every transposed expert buffer's
+/// (device ptr → allocated bytes, n, k, group_size) so the K2-verify tap can
+/// check whether the batch2_t kernel's read span fits inside the allocation.
+/// Read-only; populated only when the env is set.
+pub static T_BUF_REGISTRY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u64, (usize, usize, usize, usize)>>,
+> = std::sync::OnceLock::new();
+
+pub fn t_buf_registry_record(ptr: u64, bytes: usize, n: usize, k: usize, group_size: usize) {
+    if std::env::var("ATLAS_DSPARK_K2_TAP").is_err() {
+        return;
+    }
+    let m = T_BUF_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(mut g) = m.lock() {
+        g.insert(ptr, (bytes, n, k, group_size));
+    }
+}
+
 impl QuantizedWeight {
     /// Null weight (all pointers NULL). Used for remote experts under EP.
     pub fn null() -> Self {
@@ -218,6 +236,7 @@ impl QuantizedWeight {
         }
         let new_weight = gpu.alloc(packed_size)?;
         gpu.copy_h2d(&t_buf, new_weight)?;
+        t_buf_registry_record(new_weight.0, packed_size, n, k, 0);
 
         // Transpose B_scale: [N, K/group_size] → [K/group_size, N] into a NEW allocation.
         let num_groups = k / group_size;
@@ -232,6 +251,7 @@ impl QuantizedWeight {
         }
         let new_scale = gpu.alloc(scale_size)?;
         gpu.copy_h2d(&st_buf, new_scale)?;
+        t_buf_registry_record(new_scale.0, scale_size, n, k, group_size);
 
         Ok(QuantizedWeight {
             weight: new_weight,
