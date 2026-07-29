@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Phase 7: residual + post-norm + MoE/dense FFN.
+
+use anyhow::Result;
+use spark_runtime::gpu::DevicePtr;
+
+use super::ctx::MultiSeqCtx;
+use crate::layers::ops;
+use crate::layers::qwen3_attention::Qwen3AttentionLayer;
+
+impl Qwen3AttentionLayer {
+    pub(super) fn ms_phase_ffn(&self, c: &MultiSeqCtx<'_>, o_out: DevicePtr) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            h,
+            eps,
+            bf16,
+            hidden,
+            residual,
+            ..
+        } = *c;
+
+        if self.ffn.is_none() {
+            ops::residual_add(
+                fwd.gpu,
+                self.residual_add_k,
+                hidden,
+                o_out,
+                (n * h) as u32,
+                stream,
+            )?;
+            return Ok(());
+        }
+        // MLA models (Mistral-Small-4) route the FFN through the
+        // sequential per-token branch below, NOT the fused `forward_k2`
+        // / `forward_k3` batched-MoE kernels. The batched-MoE K=2/K=3
+        // path has a pre-existing crash for Mistral-Small-4's MoE config
+        // (illegal address in `moe_expert_silu_down_shared_batch2`) — it
+        // was never exercised because Mistral always ran at batch=1. The
+        // sequential branch calls `FfnComponent::forward` (the proven
+        // single-token MoE path used by `decode()`), processing each
+        // sequence's normed input independently, so the batched MLA
+        // attention path (issue #84) gets correct, isolated FFN output
+        // without depending on the buggy batched-MoE kernels. Fixing the
+        // batched-MoE kernel is tracked separately (out of #84 scope).
+        // Mistral-Small-4 historically crashed on fused K=2 MoE kernels.
+        // DeepSeek-V4 (MLA + mHC) needs batched MoE for EP verify throughput;
+        // default-allow fused K=2/K=3 for deepseek_v4, keep Mistral sequential.
+        // ATLAS_V4_SEQ_FFN=1 forces sequential for all MLA; ATLAS_MLA_BATCHED_MOE=1
+        // forces fused for all MLA (including Mistral, for A/B).
+        let force_seq_ffn = if std::env::var("ATLAS_MLA_BATCHED_MOE").ok().as_deref() == Some("1") {
+            false
+        } else if std::env::var("ATLAS_V4_SEQ_FFN").ok().as_deref() == Some("1") {
+            self.mla.is_some()
+        } else if self.mla.is_some() {
+            // deepseek_v4 uses the HC multi_seq path (patched above); other MLA
+            // (Mistral) stays sequential unless ATLAS_MLA_BATCHED_MOE=1.
+            fwd.config.model_type != "deepseek_v4"
+        } else {
+            false
+        };
+        if n == 3 && !force_seq_ffn {
+            let normed2 = fwd.buffers.norm_output();
+            ops::residual_add_rms_norm(
+                fwd.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                o_out,
+                &self.post_attn_norm,
+                normed2,
+                residual,
+                3,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            self.ffn.forward_k3(normed2, fwd, stream)?;
+            let moe_out = fwd.buffers.moe_output();
+            ops::residual_add(
+                fwd.gpu,
+                self.residual_add_k,
+                hidden,
+                moe_out,
+                (3 * h) as u32,
+                stream,
+            )?;
+        } else if n == 2 && !force_seq_ffn {
+            let normed2 = fwd.buffers.norm_output();
+            ops::residual_add_rms_norm(
+                fwd.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                o_out,
+                &self.post_attn_norm,
+                normed2,
+                residual,
+                2,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            self.ffn.forward_k2(normed2, fwd, stream)?;
+            let moe_out = fwd.buffers.moe_output();
+            ops::residual_add(
+                fwd.gpu,
+                self.residual_add_k,
+                hidden,
+                moe_out,
+                (2 * h) as u32,
+                stream,
+            )?;
+        } else if (4..=8).contains(&n) && !force_seq_ffn && self.ffn.can_forward_km(n as u32) {
+            // MISSING K=4 ARM (2026-07-24): the ladder jumped from n==2/3
+            // straight to the dense `forward_prefill` GEMM below, so K=4
+            // verify ran the 16 attention layers' FFN through the MMQ/tile
+            // prefill path (~156 GB/s cliff — the exact arm forward_km's
+            // docstring quantifies at 54.8 ms/step vs ~31 ms batched on the
+            // GDN stack, where it IS wired: trait_decode_batched.rs). Live
+            // K=4 A/B showed verify ~1.41x K=3 cost from this alone. Mirror
+            // of the n==3 arm with the M<=4 batched GEMV; n=5..8 (chain
+            // verify K=5..8) rides the same arm via `w4a16_gemv_batch8`.
+            let normed2 = fwd.buffers.norm_output();
+            ops::residual_add_rms_norm(
+                fwd.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                o_out,
+                &self.post_attn_norm,
+                normed2,
+                residual,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            let used = self.ffn.try_forward_km(normed2, n as u32, fwd, stream)?;
+            debug_assert!(used, "can_forward_km checked at branch entry");
+            let moe_out = fwd.buffers.moe_output();
+            ops::residual_add(
+                fwd.gpu,
+                self.residual_add_k,
+                hidden,
+                moe_out,
+                (n * h) as u32,
+                stream,
+            )?;
+        } else if !force_seq_ffn && self.ffn.is_dense() {
+            // WIDE-VERIFY BATCHED DENSE FFN (DFlash γ=16, n=17). The dense FFN
+            // (Qwen3.6-27B is dense) batches over all n rows via
+            // `forward_prefill`, reading gate/up/down ONCE instead of the
+            // per-token loop below that re-read the FFN weights n× — the
+            // measured wide-γ verify bottleneck (~844ms → target ~150ms).
+            // Direct mirror of the `forward_k3` branch above, with count=n.
+            //
+            // DENSE ONLY: on a 256-expert MoE the grouped-GEMM is a net loss at
+            // small batch, so MoE (and MLA / force_seq) fall through to the
+            // per-token loop below — no regression for 122b/35b-a3b.
+            let normed2 = fwd.buffers.norm_output();
+            ops::residual_add_rms_norm(
+                fwd.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                o_out,
+                &self.post_attn_norm,
+                normed2,
+                residual,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            self.ffn.forward_prefill(normed2, n, fwd, stream)?;
+            let moe_out = fwd.buffers.moe_output();
+            ops::residual_add(
+                fwd.gpu,
+                self.residual_add_k,
+                hidden,
+                moe_out,
+                (n * h) as u32,
+                stream,
+            )?;
+        } else {
+            // force_seq_ffn (MLA / batched-MoE-unsafe): per-token sequential.
+            // CONCURRENT-DECODE BUG (sibling of qwen3_ssm.rs:1102 fix):
+            // the per-seq hidden/residual stride must match the residual
+            // element size. The residual stream is always BF16, so the stride
+            // is `i * h * 2`; a hardcoded `i * h * 4` would over-stride into
+            // the wrong batch slot for i>=1.
+            let residual_elem = 2usize;
+            for i in 0..n {
+                let hidden_i = hidden.offset(i * h * residual_elem);
+                let o_out_i = o_out.offset(i * h * bf16); // BF16 attn output
+                let residual_i = residual.offset(i * h * residual_elem);
+                let normed2_i = fwd.buffers.norm_output().offset(i * h * bf16);
+                ops::residual_add_rms_norm(
+                    fwd.gpu,
+                    self.residual_add_rms_norm_k,
+                    hidden_i,
+                    o_out_i,
+                    &self.post_attn_norm,
+                    normed2_i,
+                    residual_i,
+                    1,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+            }
+            // Per-token MoE + residual (256-expert MoE: grouped-GEMM is a net
+            // loss at small batch — per-expert M ~1, sort/permute overhead
+            // dominates). Each forward() writes moe_output[0]; consume it
+            // immediately before the next iteration overwrites it.
+            let normed_base = fwd.buffers.norm_output();
+            for i in 0..n {
+                let hidden_i = hidden.offset(i * h * residual_elem);
+                let normed2_i = normed_base.offset(i * h * bf16);
+                let moe_out = self.ffn.forward(normed2_i, fwd, stream)?;
+                ops::residual_add(
+                    fwd.gpu,
+                    self.residual_add_k,
+                    hidden_i,
+                    moe_out,
+                    h as u32,
+                    stream,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}

@@ -1,0 +1,935 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Single-token decode body for [`super::super::Qwen3AttentionLayer`],
+//! split out of the trait impl for file-size budget. The trait impl
+//! delegates 1:1 to [`Qwen3AttentionLayer::decode_inner`].
+
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::kv_cache::PagedKvCache;
+
+use super::super::Qwen3AttentionLayer;
+use super::{diag_norm, gemma4_diag_enabled};
+use crate::layer::{ForwardContext, LayerState};
+use crate::layers::ops;
+
+impl Qwen3AttentionLayer {
+    pub(super) fn decode_inner(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        _state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        // DeepSeek-V4: Manifold-Constrained Hyper-Connections (mHC).
+        // When HC is enabled, the persistent multi-stream state lives in
+        // `hc_streams`; `hidden` is used as a single-stream scratch buffer.
+        //
+        // MTP body exception: assembled with layer_idx = num_hidden_layers so
+        // is_first=is_last=false (middle mHC only). The reference MTPBlock is
+        // trained on the multi-stream residual of the full stack, not equal
+        // expand of a collapsed hidden. Middle mHC on equal streams explodes
+        // (absmax ~1e6) and trips CUDA-700 mid-propose. Until multi-stream
+        // residual is wired from the target, run the MTP body as a plain
+        // single-stream residual block (same as hc_mult=0). Opt back into
+        // multi-stream mHC with ATLAS_V4_MTP_USE_MHC=1.
+        if self.hc.is_some() {
+            return self.decode_inner_hc(
+                hidden,
+                residual,
+                _state,
+                kv_cache,
+                seq_len,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                ctx,
+                stream,
+            );
+        }
+
+        let h = ctx.config.hidden_size;
+        let eps = ctx.config.rms_norm_eps as f32;
+        // Disable diagnostics during CUDA graph capture — diag_norm does d2h
+        // copy + sync which invalidates stream capture (status 901).
+        let gemma4_diag =
+            ctx.config.model_type == "gemma4" && gemma4_diag_enabled() && !ctx.graph_capture;
+        // The residual stream is always BF16, so `hidden` is a BF16 buffer.
+        let diag_hidden =
+            |gpu: &dyn GpuBackend, ptr: DevicePtr, n: usize, stream: u64, label: &str| {
+                diag_norm(gpu, ptr, n, stream, label);
+            };
+
+        let normed = ctx.buffers.norm_output();
+        if gemma4_diag {
+            diag_hidden(
+                ctx.gpu,
+                hidden,
+                h,
+                stream,
+                &format!("L{:02} hidden_in", self.attn_layer_idx),
+            );
+        }
+        ops::rms_norm_residual(
+            ctx.gpu,
+            self.rms_norm_residual_k,
+            hidden,
+            &self.input_norm,
+            normed,
+            residual,
+            1,
+            h as u32,
+            eps,
+            stream,
+        )?;
+        if gemma4_diag {
+            diag_norm(
+                ctx.gpu,
+                normed,
+                h,
+                stream,
+                &format!("L{:02} normed", self.attn_layer_idx),
+            );
+        }
+
+        let attn_out = self.attention_forward(
+            normed,
+            seq_len,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )?;
+        // TP all-reduce on attn_out after o_proj (Megatron row-parallel
+        // pattern). When tp_world_size==1 this is a no-op. The o_proj GEMM
+        // produced this rank's partial output on the full hidden dim; the
+        // reduction across TP ranks gives the full attention output ready
+        // for the residual add. Decode path: 1 token × hidden BF16.
+        if ctx.config.tp_world_size > 1
+            && let Some(comm) = ctx.comm
+        {
+            let bytes = h * 2; // 1 token × hidden × BF16
+            comm.all_reduce_async(attn_out.0, bytes, stream)?;
+        }
+        if gemma4_diag {
+            diag_norm(
+                ctx.gpu,
+                attn_out,
+                h,
+                stream,
+                &format!("L{:02} attn_out", self.attn_layer_idx),
+            );
+        }
+
+        // Gemma-4: post-attention norm (applied to attn output before residual add).
+        // Weight pre-scaled by layer_scalar at load time: norm(attn) * (w * scalar).
+        if let Some(ref post_norm) = self.post_attn_out_norm {
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                attn_out,
+                post_norm,
+                attn_out,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            if gemma4_diag {
+                diag_norm(
+                    ctx.gpu,
+                    attn_out,
+                    h,
+                    stream,
+                    &format!("L{:02} post_attn_normed", self.attn_layer_idx),
+                );
+            }
+        }
+
+        // Standalone attention (Nemotron-H): no post-attn FFN
+        if self.ffn.is_none() {
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                hidden,
+                attn_out,
+                h as u32,
+                stream,
+            )?;
+            return Ok(());
+        }
+
+        // Profile: time attention vs MoE separately
+        if ctx.profile {
+            use std::time::Instant;
+            ctx.gpu.synchronize(stream)?;
+            let t0 = Instant::now();
+
+            let normed2 = ctx.buffers.norm_output();
+            ops::residual_add_rms_norm(
+                ctx.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                attn_out,
+                &self.post_attn_norm,
+                normed2,
+                residual,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            let moe_out = self.ffn.forward(normed2, ctx, stream)?;
+
+            // Gemma-4: post-FFN norm
+            if let Some(ref post_norm) = self.post_ffn_out_norm {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    moe_out,
+                    post_norm,
+                    moe_out,
+                    1,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+            }
+
+            ctx.gpu.synchronize(stream)?;
+            let moe_us = t0.elapsed().as_micros();
+            tracing::info!("  Attn-MoE: {:.1}ms", moe_us as f64 / 1000.0);
+
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                hidden,
+                moe_out,
+                h as u32,
+                stream,
+            )?;
+            // Gemma-4: hidden *= layer_scalar at end of layer
+            if let Some(scalar) = self.layer_scalar {
+                self.apply_layer_scalar(ctx.gpu, hidden, h, scalar, stream)?;
+            }
+            return Ok(());
+        }
+
+        let normed2 = ctx.buffers.norm_output();
+        // ATLAS_FP32_ROUTING: attention layers also have an MoE FFN — emit the
+        // MoE-input norm in FP32 so their gates route at full precision too.
+        if self.ffn.fp32_routing_active() && self.residual_add_rms_norm_gatef32_k.0 != 0 {
+            ops::residual_add_rms_norm_gatef32(
+                ctx.gpu,
+                self.residual_add_rms_norm_gatef32_k,
+                hidden,
+                attn_out,
+                &self.post_attn_norm,
+                normed2,
+                ctx.buffers.moe_router_in_f32(),
+                residual,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        } else {
+            ops::residual_add_rms_norm(
+                ctx.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                attn_out,
+                &self.post_attn_norm,
+                normed2,
+                residual,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
+
+        // Gemma-4 26B MoE dual FFN: run MoE FIRST (before dense FFN result is used)
+        // to avoid buffer conflicts (MoE fused kernel uses attn_output internally).
+        //
+        // HF reference: combined = norm(norm1(mlp_out) + norm2(moe_out))
+        //               hidden = residual + combined
+        if let (Some(moe_ffn), Some(_pre_norm), Some(post_norm), Some(dense_norm)) = (
+            &self.moe_ffn,
+            &self.pre_moe_norm,
+            &self.post_moe_out_norm,
+            &self.post_dense_ffn_norm,
+        ) {
+            // 1. Run MoE on raw residual (before dense FFN output is touched).
+            //    MoE writes result to moe_output buffer.
+            let moe_out = moe_ffn.forward(hidden, ctx, stream)?;
+            // post-MoE norm (in-place on moe_output)
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                moe_out,
+                post_norm,
+                moe_out,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            // Save normed MoE output — dense FFN will overwrite moe_output.
+            // Use logits buffer (vocab_size * 2 bytes >> h * 2) — gate_logits is too small
+            let moe_saved = ctx.buffers.logits();
+            ctx.gpu.copy_d2d_async(moe_out, moe_saved, h * 2, stream)?;
+
+            // 2. Dense FFN (writes to moe_output, overwriting MoE result)
+            let dense_out = self.ffn.forward(normed2, ctx, stream)?;
+            // post-dense norm (layernorm_1)
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                dense_out,
+                dense_norm,
+                dense_out,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+
+            // 3. Combine: dense_normed + moe_normed → dense_out (in-place)
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                dense_out,
+                moe_saved,
+                h as u32,
+                stream,
+            )?;
+
+            // 4. post_feedforward_layernorm on combined
+            if let Some(ref combined_norm) = self.post_ffn_out_norm {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    dense_out,
+                    combined_norm,
+                    dense_out,
+                    1,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+            }
+
+            // 5. Residual add: hidden += combined
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                hidden,
+                dense_out,
+                h as u32,
+                stream,
+            )?;
+        } else {
+            // Non-MoE (31B dense)
+            if gemma4_diag {
+                diag_norm(
+                    ctx.gpu,
+                    normed2,
+                    h,
+                    stream,
+                    &format!("L{:02} normed2", self.attn_layer_idx),
+                );
+            }
+            let dense_out = self.ffn.forward(normed2, ctx, stream)?;
+            if gemma4_diag {
+                diag_norm(
+                    ctx.gpu,
+                    dense_out,
+                    h,
+                    stream,
+                    &format!("L{:02} dense_out", self.attn_layer_idx),
+                );
+            }
+            if let Some(ref post_norm) = self.post_ffn_out_norm {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    dense_out,
+                    post_norm,
+                    dense_out,
+                    1,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+                if gemma4_diag {
+                    diag_norm(
+                        ctx.gpu,
+                        dense_out,
+                        h,
+                        stream,
+                        &format!("L{:02} post_ffn_normed", self.attn_layer_idx),
+                    );
+                }
+            }
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                hidden,
+                dense_out,
+                h as u32,
+                stream,
+            )?;
+        }
+
+        if gemma4_diag {
+            diag_hidden(
+                ctx.gpu,
+                hidden,
+                h,
+                stream,
+                &format!("L{:02} post_residual", self.attn_layer_idx),
+            );
+        }
+
+        // Gemma-4: hidden *= layer_scalar at end of layer
+        if let Some(scalar) = self.layer_scalar {
+            self.apply_layer_scalar(ctx.gpu, hidden, h, scalar, stream)?;
+            if gemma4_diag {
+                diag_hidden(
+                    ctx.gpu,
+                    hidden,
+                    h,
+                    stream,
+                    &format!(
+                        "L{:02} post_layer_scalar(scalar={:.4})",
+                        self.attn_layer_idx, scalar
+                    ),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// HC-enabled decode inner.  The persistent state is `hc_streams`
+    /// ([1, hc_mult, H] BF16); `hidden` is used as a single-stream scratch.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_inner_hc(
+        &self,
+        hidden: DevicePtr,
+        _residual: DevicePtr,
+        _state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let hc = self.hc.as_ref().unwrap();
+        let hc_mult = hc.hc_mult as u32;
+        let is_first_layer = self.attn_layer_idx == 0;
+        let is_last_layer = self.attn_layer_idx + 1 == ctx.config.num_hidden_layers;
+
+        macro_rules! prof_hc {
+            ($label:expr, $body:expr) => {{
+                if ctx.profile {
+                    ctx.gpu.synchronize(stream)?;
+                    let started = std::time::Instant::now();
+                    let result = $body;
+                    ctx.gpu.synchronize(stream)?;
+                    tracing::info!(
+                        "    V4 HC {}: {:.0}μs",
+                        $label,
+                        started.elapsed().as_micros()
+                    );
+                    result
+                } else {
+                    $body
+                }
+            }};
+        }
+
+        // MTP body (layer_idx >= num_hidden_layers): default to single-stream
+        // residual with vanilla RMSNorm. Full multi-stream mHC requires the
+        // target multi-stream residual as input (reference MTPBlock); equal
+        // expand of a collapsed hidden explodes and has tripped CUDA-700.
+        // Enable multi-stream mHC with ATLAS_V4_MTP_USE_MHC=1.
+        // MTP body: private KV cache has 1 layer (pool index remapped via
+        // kv_layer_idx). Default single-stream residual; full mHC needs
+        // multi-stream residual from target (ATLAS_V4_MTP_USE_MHC=1).
+        // ATLAS_V4_MTP_BODY_ATTN_ONLY=1 skips MoE (bisect CUDA-700).
+        let mtp_single = (kv_cache.num_layers() == 1
+            || self.attn_layer_idx >= ctx.config.num_hidden_layers)
+            && std::env::var("ATLAS_V4_MTP_USE_MHC").ok().as_deref() == Some("0");
+        if mtp_single {
+            let attn_only =
+                std::env::var("ATLAS_V4_MTP_BODY_ATTN_ONLY").ok().as_deref() == Some("1");
+            let normed = ctx.buffers.norm_output();
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                hidden,
+                &self.input_norm,
+                normed,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            let attn_out = self.attention_forward(
+                normed,
+                seq_len,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                kv_cache,
+                ctx,
+                stream,
+            )?;
+            if let Some(ref post_norm) = self.post_attn_out_norm {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    attn_out,
+                    post_norm,
+                    attn_out,
+                    1,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+            }
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                hidden,
+                attn_out,
+                h as u32,
+                stream,
+            )?;
+            if self.ffn.is_none() || attn_only {
+                return Ok(());
+            }
+            let normed2 = ctx.buffers.norm_output();
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                hidden,
+                &self.post_attn_norm,
+                normed2,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            // MTP MoE: default through forward_prefill(M=1). The decode MoE
+            // path OOMs/OOBs under force_all_experts on EP=2 (CUDA-700 after
+            // ~50–60 draft steps). Prefill grouped path is stable. Force
+            // decode MoE with ATLAS_V4_MTP_MOE_DECODE=1 for A/B.
+            let use_decode_moe =
+                std::env::var("ATLAS_V4_MTP_MOE_DECODE").ok().as_deref() == Some("1");
+            let ffn_out = if use_decode_moe {
+                self.ffn.forward(normed2, ctx, stream)?
+            } else {
+                self.ffn.forward_prefill(normed2, 1, ctx, stream)?;
+                ctx.buffers.moe_output()
+            };
+            if let Some(ref post_norm) = self.post_ffn_out_norm {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    ffn_out,
+                    post_norm,
+                    ffn_out,
+                    1,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+            }
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                hidden,
+                ffn_out,
+                h as u32,
+                stream,
+            )?;
+            return Ok(());
+        }
+        let hc_streams = ctx.buffers.hc_streams();
+        let post = ctx.buffers.hc_post();
+        let comb = ctx.buffers.hc_comb();
+        let diag_enabled = std::env::var("ATLAS_DIAG_V4").is_ok_and(|v| v == "1" || v == "true");
+        let diag_all =
+            std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
+        let diag_this = diag_enabled && (self.attn_layer_idx == 0 || diag_all);
+
+        // 1. Expand single-stream embedding into hc_mult copies on first layer.
+        if is_first_layer {
+            ops::hc_expand(
+                ctx.gpu,
+                self.hc_expand_k,
+                hidden,
+                hc_streams,
+                1,
+                h as u32,
+                hc_mult,
+                stream,
+            )?;
+        }
+
+        // ── Attention sublayer ──
+        prof_hc!(
+            "hc_pre-attn",
+            ops::hc_pre_parallel(
+                ctx.gpu,
+                self.hc_pre_mix_parallel_k,
+                self.hc_pre_finalize_k,
+                hc_streams,
+                hc.attn.hc_fn,
+                hc.attn.hc_scale,
+                hc.attn.hc_base,
+                hidden,
+                post,
+                comb,
+                1,
+                h as u32,
+                hc_mult,
+                hc.sinkhorn_iters as u32,
+                eps,
+                hc.hc_eps,
+                stream,
+            )
+        )?;
+        if diag_this {
+            super::diag_norm(
+                ctx.gpu,
+                hidden,
+                h,
+                stream,
+                &format!("V4-decode L{} hc_pre-attn", self.attn_layer_idx),
+            );
+            super::diag_norm_f32(
+                ctx.gpu,
+                post,
+                hc_mult as usize,
+                stream,
+                &format!("V4-decode L{} post-attn", self.attn_layer_idx),
+            );
+            super::diag_norm_f32(
+                ctx.gpu,
+                comb,
+                (hc_mult as usize) * (hc_mult as usize),
+                stream,
+                &format!("V4-decode L{} comb-attn", self.attn_layer_idx),
+            );
+        }
+
+        let normed = ctx.buffers.norm_output();
+        prof_hc!(
+            "input-rms",
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                hidden,
+                &self.input_norm,
+                normed,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )
+        )?;
+
+        let attn_out = self.attention_forward(
+            normed,
+            seq_len,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )?;
+
+        if ctx.config.tp_world_size > 1
+            && let Some(comm) = ctx.comm
+        {
+            let bytes = h * 2;
+            prof_hc!(
+                "attn-all-reduce",
+                comm.all_reduce_async(attn_out.0, bytes, stream)
+            )?;
+        }
+
+        if let Some(ref post_norm) = self.post_attn_out_norm {
+            prof_hc!(
+                "post-attn-out-rms",
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    attn_out,
+                    post_norm,
+                    attn_out,
+                    1,
+                    h as u32,
+                    eps,
+                    stream,
+                )
+            )?;
+        }
+
+        // Standalone attention (no FFN)
+        if self.ffn.is_none() {
+            prof_hc!(
+                "hc_post-attn-only",
+                ops::hc_post(
+                    ctx.gpu,
+                    self.hc_post_k,
+                    attn_out,
+                    hc_streams,
+                    post,
+                    comb,
+                    hc_streams,
+                    1,
+                    h as u32,
+                    hc_mult,
+                    stream,
+                )
+            )?;
+            if is_last_layer && let Some(ref head) = hc.head {
+                ops::hc_head(
+                    ctx.gpu,
+                    self.hc_head_k,
+                    hc_streams,
+                    head.hc_fn,
+                    head.hc_scale,
+                    head.hc_base,
+                    hidden,
+                    1,
+                    h as u32,
+                    hc_mult,
+                    eps,
+                    hc.hc_eps,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+
+        // Expand attention output back into multi-stream state.
+        prof_hc!(
+            "hc_post-attn",
+            ops::hc_post(
+                ctx.gpu,
+                self.hc_post_k,
+                attn_out,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                1,
+                h as u32,
+                hc_mult,
+                stream,
+            )
+        )?;
+        if diag_this {
+            super::diag_norm(
+                ctx.gpu,
+                hc_streams,
+                h,
+                stream,
+                &format!("V4-decode L{} hc_post-attn", self.attn_layer_idx),
+            );
+            super::diag_norm(
+                ctx.gpu,
+                hc_streams,
+                (hc_mult as usize) * (h),
+                stream,
+                &format!(
+                    "V4-decode L{} hc_post-attn ALL_STREAMS",
+                    self.attn_layer_idx
+                ),
+            );
+        }
+
+        // ── FFN sublayer ──
+        prof_hc!(
+            "hc_pre-ffn",
+            ops::hc_pre_parallel(
+                ctx.gpu,
+                self.hc_pre_mix_parallel_k,
+                self.hc_pre_finalize_k,
+                hc_streams,
+                hc.ffn.hc_fn,
+                hc.ffn.hc_scale,
+                hc.ffn.hc_base,
+                hidden,
+                post,
+                comb,
+                1,
+                h as u32,
+                hc_mult,
+                hc.sinkhorn_iters as u32,
+                eps,
+                hc.hc_eps,
+                stream,
+            )
+        )?;
+        if diag_this {
+            super::diag_norm(
+                ctx.gpu,
+                hidden,
+                h,
+                stream,
+                &format!("V4-decode L{} hc_pre-ffn", self.attn_layer_idx),
+            );
+            super::diag_norm_f32(
+                ctx.gpu,
+                post,
+                hc_mult as usize,
+                stream,
+                &format!("V4-decode L{} post-ffn", self.attn_layer_idx),
+            );
+            super::diag_norm_f32(
+                ctx.gpu,
+                comb,
+                (hc_mult as usize) * (hc_mult as usize),
+                stream,
+                &format!("V4-decode L{} comb-ffn", self.attn_layer_idx),
+            );
+        }
+
+        let normed2 = ctx.buffers.norm_output();
+        prof_hc!(
+            "post-attn-rms",
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                hidden,
+                &self.post_attn_norm,
+                normed2,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )
+        )?;
+
+        let ffn_out = if self.attn_layer_idx == ctx.config.num_hidden_layers
+            && ctx.config.model_type == "deepseek_v4"
+        {
+            // The synthetic V4 MTP body owns all routed experts locally and
+            // prepares transposed pointer tables at load time. Its native
+            // MXFP4 experts must use that one-token prefill dispatch; the
+            // generic NVFP4 decode GEMV dereferences the wrong weight layout.
+            self.ffn.forward_prefill(normed2, 1, ctx, stream)?;
+            ctx.buffers.moe_output()
+        } else {
+            self.ffn.forward(normed2, ctx, stream)?
+        };
+
+        if let Some(ref post_norm) = self.post_ffn_out_norm {
+            prof_hc!(
+                "post-ffn-out-rms",
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    ffn_out,
+                    post_norm,
+                    ffn_out,
+                    1,
+                    h as u32,
+                    eps,
+                    stream,
+                )
+            )?;
+        }
+
+        if let Some(scalar) = self.layer_scalar {
+            self.apply_layer_scalar(ctx.gpu, ffn_out, h, scalar, stream)?;
+        }
+
+        prof_hc!(
+            "hc_post-ffn",
+            ops::hc_post(
+                ctx.gpu,
+                self.hc_post_k,
+                ffn_out,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                1,
+                h as u32,
+                hc_mult,
+                stream,
+            )
+        )?;
+        if diag_this {
+            super::diag_norm(
+                ctx.gpu,
+                hc_streams,
+                h,
+                stream,
+                &format!("V4-decode L{} hc_post-ffn", self.attn_layer_idx),
+            );
+            super::diag_norm(
+                ctx.gpu,
+                hc_streams,
+                (hc_mult as usize) * (h),
+                stream,
+                &format!("V4-decode L{} hc_post-ffn ALL_STREAMS", self.attn_layer_idx),
+            );
+        }
+
+        if is_last_layer && let Some(ref head) = hc.head {
+            ops::hc_head(
+                ctx.gpu,
+                self.hc_head_k,
+                hc_streams,
+                head.hc_fn,
+                head.hc_scale,
+                head.hc_base,
+                hidden,
+                1,
+                h as u32,
+                hc_mult,
+                eps,
+                hc.hc_eps,
+                stream,
+            )?;
+            if diag_this {
+                super::diag_norm(
+                    ctx.gpu,
+                    hidden,
+                    h,
+                    stream,
+                    &format!("V4-decode L{} hc_head", self.attn_layer_idx),
+                );
+            }
+        } else if is_last_layer {
+            tracing::warn!(
+                "V4-decode L{}: hc_head SKIPPED (no head weights)",
+                self.attn_layer_idx
+            );
+        }
+
+        Ok(())
+    }
+}
