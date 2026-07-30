@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Env-gated phase timing for the MTP K=2 verify path (#237 fixed-overhead hunt).
+//! Env-gated phase timing for the MTP verify paths at **K=2, K=3 and K=4**
+//! (#237 fixed-overhead hunt; widths 3/4 added to measure how verify cost scales
+//! with width, which decides whether a wider drafter can pay for itself).
 //!
 //! `ATLAS_MTP_TIMING=1` arms per-phase accumulators across the verify step:
 //! sync/EP/forward, the per-position host pipeline (D2H, dequant, processor
@@ -18,7 +20,7 @@
 //! the gate would call net-negative — required to collect ~100 verify samples
 //! for attribution. Never set in production.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Verify steps per summary line.
@@ -71,9 +73,39 @@ const NAMES: [&str; NUM_PHASES] = [
     "TOTAL",
 ];
 
-static SUM_US: [AtomicU64; NUM_PHASES] = [const { AtomicU64::new(0) }; NUM_PHASES];
-static COUNT: [AtomicU64; NUM_PHASES] = [const { AtomicU64::new(0) }; NUM_PHASES];
-static STEPS: AtomicU64 = AtomicU64::new(0);
+/// Verify widths with their own accumulator set: K=2, K=3, K=4.
+const NUM_WIDTHS: usize = 3;
+
+/// Accumulators are **per verify width**. One request can mix widths — the V4
+/// prompt bootstrap verifies at K=3 while steady-state decode at
+/// `num_drafts=3` verifies at K=4 (both ladders in `mtp_step.rs`) — and
+/// averaging those together is exactly what makes `fwd` unattributable by
+/// width. Keyed by width, each summary line describes one width only.
+static SUM_US: [[AtomicU64; NUM_PHASES]; NUM_WIDTHS] =
+    [const { [const { AtomicU64::new(0) }; NUM_PHASES] }; NUM_WIDTHS];
+static COUNT: [[AtomicU64; NUM_PHASES]; NUM_WIDTHS] =
+    [const { [const { AtomicU64::new(0) }; NUM_PHASES] }; NUM_WIDTHS];
+static STEPS: [AtomicU64; NUM_WIDTHS] = [const { AtomicU64::new(0) }; NUM_WIDTHS];
+
+/// Verify width of the step currently being timed; set by [`begin_step`].
+/// The measured contract runs `max_batch=1`, one verify step at a time, so a
+/// plain global keeps `record` allocation-free.
+static CUR_WIDTH: AtomicUsize = AtomicUsize::new(2);
+
+/// Accumulator slot for the width being timed. Widths outside 2..=4 clamp
+/// rather than panic — a mis-set width must never take down a serve.
+fn slot() -> usize {
+    CUR_WIDTH.load(Ordering::Relaxed).clamp(2, 4) - 2
+}
+
+/// Declare the verify width of the step about to be timed. Call once at the top
+/// of each `step_verify_kN`, before any [`record`].
+pub(crate) fn begin_step(width: usize) {
+    if !enabled() {
+        return;
+    }
+    CUR_WIDTH.store(width, Ordering::Relaxed);
+}
 
 /// Whether `ATLAS_MTP_TIMING=1` armed the accumulators (cached once).
 pub(crate) fn enabled() -> bool {
@@ -94,26 +126,30 @@ pub(crate) fn record(phase: Phase, since: Instant) {
         return;
     }
     let us = u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX);
-    SUM_US[phase as usize].fetch_add(us, Ordering::Relaxed);
-    COUNT[phase as usize].fetch_add(1, Ordering::Relaxed);
+    let w = slot();
+    SUM_US[w][phase as usize].fetch_add(us, Ordering::Relaxed);
+    COUNT[w][phase as usize].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Mark one verify step complete (records `StepTotal` from `step_start`) and
-/// emit the periodic summary. Call once per `step_verify_k2` invocation.
+/// emit the periodic summary for the current verify width. Call once per
+/// `step_verify_kN` invocation, on every exit path that actually verified.
 pub(crate) fn step_done(step_start: Instant, seq_len: usize) {
     if !enabled() {
         return;
     }
     record(Phase::StepTotal, step_start);
-    let steps = STEPS.fetch_add(1, Ordering::Relaxed) + 1;
+    let w = slot();
+    let width = w + 2;
+    let steps = STEPS[w].fetch_add(1, Ordering::Relaxed) + 1;
     if !steps.is_multiple_of(SUMMARY_PERIOD) {
         return;
     }
     use std::fmt::Write as _;
     let mut line = String::with_capacity(NUM_PHASES * 32);
     for i in 0..NUM_PHASES {
-        let sum = SUM_US[i].swap(0, Ordering::Relaxed);
-        let cnt = COUNT[i].swap(0, Ordering::Relaxed);
+        let sum = SUM_US[w][i].swap(0, Ordering::Relaxed);
+        let cnt = COUNT[w][i].swap(0, Ordering::Relaxed);
         if cnt == 0 {
             continue;
         }
@@ -123,5 +159,5 @@ pub(crate) fn step_done(step_start: Instant, seq_len: usize) {
         let fires = cnt as f64 / SUMMARY_PERIOD as f64;
         let _ = write!(line, " {}={per_step_ms:.2}ms(x{fires:.1})", NAMES[i]);
     }
-    tracing::info!("MTP K2 timing [{SUMMARY_PERIOD} steps, seq_len={seq_len}]:{line}");
+    tracing::info!("MTP K{width} timing [{SUMMARY_PERIOD} steps, seq_len={seq_len}]:{line}");
 }

@@ -165,9 +165,16 @@ impl MtpGate {
     /// `num_drafts` is retained for construction-site compatibility and
     /// logging; arbitration is measurement-driven and does not model K.
     pub fn new(num_drafts: usize) -> Self {
+        // `K=` reports the VERIFY WIDTH (num_drafts + 1 target rows), not the
+        // draft count: `--num-drafts 1` verifies at K=2 and dispatches
+        // `step_verify_k2`. The previous form printed `num_drafts` under a `K=`
+        // label, so a run capturing a K=3 graph logged "K=2" — an off-by-one
+        // that made the log disagree with the dispatched path.
+        let verify_width = num_drafts + 1;
         tracing::info!(
-            "MTP gate: throughput-arbitrated (K={num_drafts}); window={WINDOW_STEPS} steps, \
-             dwell={SWITCH_DWELL_WINDOWS}, reprobe={} tok, refresh={} tok",
+            "MTP gate: throughput-arbitrated (num_drafts={num_drafts}, verify K={verify_width}); \
+             window={WINDOW_STEPS} steps, dwell={SWITCH_DWELL_WINDOWS}, reprobe={} tok, \
+             refresh={} tok",
             reprobe_tokens(),
             serial_refresh_tokens(),
         );

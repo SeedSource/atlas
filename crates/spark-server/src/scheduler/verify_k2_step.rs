@@ -65,6 +65,7 @@ pub fn step_verify_k2(
     dflash_verify_raw_argmax: bool,
 ) {
     use crate::scheduler::mtp_timing::{self, Phase};
+    mtp_timing::begin_step(2);
     let t_step = Instant::now();
     let t_sync = Instant::now();
     if let Err(e) = model.sync_secondary() {

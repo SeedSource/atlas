@@ -105,6 +105,9 @@ pub fn step_verify_k3(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
+    use crate::scheduler::mtp_timing::{self, Phase};
+    mtp_timing::begin_step(3);
+    let t_step = Instant::now();
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
         a.finished = true;
@@ -156,6 +159,7 @@ pub fn step_verify_k3(
             }
         }
     };
+    mtp_timing::record(Phase::VerifyForward, t_verify);
     let verify_us = t_verify.elapsed().as_micros();
     a.last_token_time = Instant::now();
     let (v0_argmax, v1_argmax, v2_argmax) = (result_vec[0], result_vec[1], result_vec[2]);
@@ -327,12 +331,14 @@ pub fn step_verify_k3(
                 tracing::error!("run_mtp_propose_multi: {e:#}");
             }
         }
+        mtp_timing::record(Phase::Propose, t_propose);
         let propose_us = t_propose.elapsed().as_micros();
         tracing::debug!(
             "K3 ACCEPT-2: verify={verify_us}μs propose={propose_us}μs seq_len={}",
             a.seq.seq_len
         );
         k3_record_outcome(2, a.seq.seq_len);
+        mtp_timing::step_done(t_step, a.seq.seq_len);
     } else if num_accepted == 1 {
         a.seq.seq_len -= 1;
         a.seq.tokens.pop();
@@ -374,12 +380,14 @@ pub fn step_verify_k3(
                 tracing::error!("run_mtp_propose_multi: {e:#}");
             }
         }
+        mtp_timing::record(Phase::Propose, t_propose);
         let propose_us = t_propose.elapsed().as_micros();
         tracing::debug!(
             "K3 ACCEPT-1: verify={verify_us}μs propose={propose_us}μs seq_len={}",
             a.seq.seq_len
         );
         k3_record_outcome(1, a.seq.seq_len);
+        mtp_timing::step_done(t_step, a.seq.seq_len);
     } else {
         a.seq.seq_len -= 2;
         a.seq.tokens.pop();
@@ -419,11 +427,13 @@ pub fn step_verify_k3(
                 tracing::error!("run_mtp_propose_multi: {e:#}");
             }
         }
+        mtp_timing::record(Phase::Propose, t_propose);
         let propose_us = t_propose.elapsed().as_micros();
         tracing::debug!(
             "K3 REJECT: verify={verify_us}μs propose={propose_us}μs seq_len={}",
             a.seq.seq_len
         );
         k3_record_outcome(0, a.seq.seq_len);
+        mtp_timing::step_done(t_step, a.seq.seq_len);
     }
 }

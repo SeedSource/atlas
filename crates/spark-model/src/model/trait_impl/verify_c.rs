@@ -167,8 +167,17 @@ impl TransformerModel {
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
+        // ATLAS_K3_DIAG=1: run the K=3 verify EAGERLY (no CUDA graph) so an
+        // illegal access is attributed to its launch instead of surfacing as an
+        // opaque status-700 on the post-graph D2H. Mirrors ATLAS_K2_DIAG
+        // (verify_b.rs) and ATLAS_K4_DIAG (verify_c2.rs) — K=3 was the one width
+        // with no eager hatch, which is why localizing the null shared-gate
+        // CUDA-700 needed the ATLAS_EP_GRAPHS=0 side door. Diagnostic only;
+        // default behavior is byte-for-byte unchanged when the env is unset.
+        let k3_diag = std::env::var("ATLAS_K3_DIAG").ok().as_deref() == Some("1");
         let ep_graphs = std::env::var("ATLAS_EP_GRAPHS").is_ok_and(|v| v == "1" || v == "true");
-        let use_graphs = (self.comm.is_none() || ep_graphs) && !hss_engaged && !lora_eager;
+        let use_graphs =
+            (self.comm.is_none() || ep_graphs) && !hss_engaged && !lora_eager && !k3_diag;
 
         // DeepSeek-V4 hash-MoE needs verify token ids (same as K=2 verify_b).
         // Upload pre-graph; graphs then read the stable device buffer.
